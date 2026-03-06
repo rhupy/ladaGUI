@@ -18,7 +18,7 @@
   // Settings
   let detectionModel = $state("v4-accurate");
   let maxClipLength = $state(300);
-  let encoder = $state("libx265");
+  let encoder = $state("hevc_nvenc");
   let crf = $state(18);
   let preset = $state("medium");
   let prefix = $state("[nm]");

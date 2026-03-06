@@ -212,16 +212,11 @@ async fn process_files(
             "-v".into(), format!("{}:/tmp", tmp_dir_docker),
         ];
 
-        // Mount NVENC libraries for GPU encoding (WSL2 only)
-        // On native Windows, Docker Desktop handles GPU libs automatically
-        if !cfg!(windows) {
-            if std::path::Path::new("/usr/lib/wsl/lib").exists() {
-                args.push("-v".into());
-                args.push("/usr/lib/wsl/lib:/usr/lib/wsl/lib".into());
-                args.push("-e".into());
-                args.push("LD_LIBRARY_PATH=/usr/lib/wsl/lib".into());
-            }
-        }
+        // Enable NVENC/NVDEC video encoding in container.
+        // nvidia-container-toolkit only exposes compute by default;
+        // adding "video" capability mounts libnvidia-encode.so into the container.
+        args.push("-e".into());
+        args.push("NVIDIA_DRIVER_CAPABILITIES=compute,video,utility".into());
 
         args.extend([
             "ladaapp/lada:latest".into(),
