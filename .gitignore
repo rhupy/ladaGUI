@@ -5,6 +5,7 @@ target/
 # Build output
 dist/
 build/
+src/src-tauri/target/
 
 # Lada original source (cloned for reference)
 lada/
@@ -35,3 +36,6 @@ Thumbs.db
 # Environment
 .env
 *.log
+
+# Lock files (regenerated on install)
+package-lock.json
