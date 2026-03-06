@@ -48,7 +48,7 @@ async fn check_docker() -> Result<String, String> {
 
     if output.status.success() {
         let gpu_output = Command::new("docker")
-            .args(["run", "--rm", "--gpus", "all", "nvidia/cuda:12.0.0-base-ubuntu22.04", "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
+            .args(["run", "--rm", "--gpus", "all", "ladaapp/lada:latest", "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
             .output()
             .await;
 
@@ -205,21 +205,37 @@ async fn process_files(
         let input_file_name = input_path.file_name().unwrap().to_string_lossy().to_string();
 
         let mut cmd = Command::new("docker");
-        cmd.args([
-            "run", "--rm", "--gpus", "all",
-            "-v", &format!("{}:/input", input_dir_docker),
-            "-v", &format!("{}:/output", output_dir_docker),
-            "-v", &format!("{}:/tmp", tmp_dir_docker),
-            "ladaapp/lada:latest",
-            "--input", &format!("/input/{}", input_file_name),
-            "--output", &format!("/output/{}", output_filename),
-            "--temporary-directory", "/tmp",
-            "--mosaic-detection-model", &settings.detection_model,
-            "--max-clip-length", &settings.max_clip_length.to_string(),
-            "--encoder", encoder,
-            "--encoder-options", &encoder_options,
+        let mut args: Vec<String> = vec![
+            "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
+            "-v".into(), format!("{}:/input", input_dir_docker),
+            "-v".into(), format!("{}:/output", output_dir_docker),
+            "-v".into(), format!("{}:/tmp", tmp_dir_docker),
+        ];
+
+        // Mount NVENC libraries for GPU encoding (WSL2)
+        if !cfg!(windows) {
+            let wsl_lib = std::path::Path::new("/usr/lib/wsl/lib");
+            if wsl_lib.exists() {
+                args.push("-v".into());
+                args.push("/usr/lib/wsl/lib:/usr/lib/wsl/lib".into());
+                args.push("-e".into());
+                args.push("LD_LIBRARY_PATH=/usr/lib/wsl/lib".into());
+            }
+        }
+
+        args.extend([
+            "ladaapp/lada:latest".into(),
+            "--input".into(), format!("/input/{}", input_file_name),
+            "--output".into(), format!("/output/{}", output_filename),
+            "--temporary-directory".into(), "/tmp".into(),
+            "--mosaic-detection-model".into(), settings.detection_model.clone(),
+            "--max-clip-length".into(), settings.max_clip_length.to_string(),
+            "--encoder".into(), encoder.clone(),
+            "--encoder-options".into(), encoder_options.clone(),
         ]);
 
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        cmd.args(&arg_refs);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -300,7 +316,12 @@ async fn process_files(
             break;
         }
 
-        let (final_status, final_msg) = if status.success() {
+        // Verify output file actually exists and has content
+        let output_file_path = output_dir.join(&output_filename);
+        let output_valid = output_file_path.exists()
+            && std::fs::metadata(&output_file_path).map(|m| m.len() > 1000).unwrap_or(false);
+
+        let (final_status, final_msg) = if status.success() && output_valid {
             // Delete original file if enabled
             if settings.delete_original {
                 match std::fs::remove_file(&input_path) {
@@ -310,6 +331,9 @@ async fn process_files(
             } else {
                 ("done".to_string(), format!("Saved: {}", output_filename))
             }
+        } else if status.success() && !output_valid {
+            let stderr_tail = last_stderr_lines.join("\n");
+            ("error".to_string(), format!("Process exited OK but output file missing or empty.\n{}", stderr_tail))
         } else {
             let stderr_tail = last_stderr_lines.join("\n");
             ("error".to_string(), format!("Exit code: {:?}\n{}", status.code(), stderr_tail))
