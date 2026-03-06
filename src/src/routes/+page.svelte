@@ -67,7 +67,8 @@
 
     listen("progress", (event) => {
       const p = event.payload;
-      const idx = p.file_index;
+      // Map backend index (pending-only) to actual files array index
+      const idx = pendingIndices?.[p.file_index] ?? p.file_index;
       if (idx < files.length) {
         files[idx] = {
           ...files[idx],
@@ -147,9 +148,11 @@
     );
 
     processing = true;
-    const pendingFiles = files
-      .filter((f) => f.status === "pending")
-      .map((f) => f.path);
+    // Track original indices of pending files so progress events map correctly
+    pendingIndices = files
+      .map((f, i) => (f.status === "pending" ? i : -1))
+      .filter((i) => i !== -1);
+    const pendingFiles = pendingIndices.map((i) => files[i].path);
 
     try {
       await invoke("process_files", {
@@ -216,6 +219,7 @@
   }
 
   let dragging = $state(false);
+  let pendingIndices = $state(null);
 </script>
 
 <main>
