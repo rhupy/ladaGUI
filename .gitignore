@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+target/
+
+# Build output
+dist/
+build/
+
+# Lada original source (cloned for reference)
+lada/
+
+# Test files and outputs
+test/
+output/
+tmp/
+
+# Real-ESRGAN binary
+realesrgan-bin/
+realesrgan.zip
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+
+# Rust
+*.rs.bk
+
+# Environment
+.env
+*.log
