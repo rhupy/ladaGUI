@@ -24,6 +24,7 @@
   let prefix = $state("[nm]");
   let sameDirectory = $state(true);
   let outputDirectory = $state("");
+  let deleteOriginal = $state(true);
 
   // Settings panel toggle
   let showSettings = $state(false);
@@ -156,6 +157,7 @@
           prefix: prefix,
           same_directory: sameDirectory,
           output_directory: outputDirectory,
+          delete_original: deleteOriginal,
         },
       });
     } catch (e) {
@@ -281,6 +283,16 @@
       <div class="setting-row">
         <label>Filename Prefix</label>
         <input type="text" bind:value={prefix} disabled={processing} />
+      </div>
+      <div class="setting-row">
+        <label>
+          <input
+            type="checkbox"
+            bind:checked={deleteOriginal}
+            disabled={processing}
+          />
+          Delete original after success
+        </label>
       </div>
       <div class="setting-row">
         <label>

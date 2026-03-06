@@ -18,6 +18,7 @@ pub struct LadaSettings {
     prefix: String,
     same_directory: bool,
     output_directory: String,
+    delete_original: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -300,7 +301,15 @@ async fn process_files(
         }
 
         let (final_status, final_msg) = if status.success() {
-            ("done".to_string(), format!("Saved: {}", output_filename))
+            // Delete original file if enabled
+            if settings.delete_original {
+                match std::fs::remove_file(&input_path) {
+                    Ok(_) => ("done".to_string(), format!("Saved: {} (original deleted)", output_filename)),
+                    Err(e) => ("done".to_string(), format!("Saved: {} (failed to delete original: {})", output_filename, e)),
+                }
+            } else {
+                ("done".to_string(), format!("Saved: {}", output_filename))
+            }
         } else {
             let stderr_tail = last_stderr_lines.join("\n");
             ("error".to_string(), format!("Exit code: {:?}\n{}", status.code(), stderr_tail))
