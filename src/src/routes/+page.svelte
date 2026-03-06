@@ -41,6 +41,23 @@
   onMount(async () => {
     await checkDocker();
 
+    // Prevent default drag behavior on the entire document
+    // This is REQUIRED for WebView2 to accept file drops
+    document.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragging = true;
+    });
+    document.addEventListener("drop", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragging = false;
+    });
+    document.addEventListener("dragleave", (e) => {
+      // Only set false when leaving the window entirely
+      if (e.relatedTarget === null) dragging = false;
+    });
+
     listen("progress", (event) => {
       const p = event.payload;
       const idx = p.file_index;
