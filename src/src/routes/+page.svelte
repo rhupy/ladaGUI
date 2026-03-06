@@ -10,6 +10,11 @@
   let processing = $state(false);
   let updating = $state(false);
 
+  // Overall progress tracking
+  let currentFileRemaining = $state("");
+  let currentFileSpeed = $state("");
+  let totalFiles = $state(0);
+
   // Settings
   let detectionModel = $state("v4-accurate");
   let maxClipLength = $state(300);
@@ -69,6 +74,13 @@
           status: p.status,
           message: p.message,
         };
+      }
+      totalFiles = p.total_files || files.length;
+      if (p.remaining) currentFileRemaining = p.remaining;
+      if (p.speed) currentFileSpeed = p.speed;
+      if (p.status === "done" || p.status === "error") {
+        currentFileRemaining = "";
+        currentFileSpeed = "";
       }
     });
 
@@ -328,7 +340,12 @@
                 class:done={file.status === "done"}
                 style="width: {file.progress}%"
               ></div>
-              <span class="progress-text">{Math.round(file.progress)}%</span>
+              <span class="progress-text">
+                {Math.round(file.progress)}%
+                {#if file.status === "processing" && currentFileRemaining && currentFileRemaining !== "?"}
+                  - {currentFileRemaining}
+                {/if}
+              </span>
             </div>
           {/if}
           {#if file.message}
@@ -338,6 +355,29 @@
       {/each}
     {/if}
   </div>
+
+  {#if processing}
+    {@const doneCount = files.filter((f) => f.status === "done").length}
+    {@const processingFile = files.find((f) => f.status === "processing")}
+    {@const overallPct = totalFiles > 0 ? ((doneCount + (processingFile ? processingFile.progress / 100 : 0)) / totalFiles) * 100 : 0}
+    <div class="overall-progress">
+      <div class="overall-header">
+        <span>Overall: {doneCount}/{totalFiles} files</span>
+        <span class="overall-stats">
+          {#if currentFileRemaining && currentFileRemaining !== "?"}
+            Remaining: {currentFileRemaining}
+          {/if}
+          {#if currentFileSpeed && currentFileSpeed !== "?"}
+            &nbsp;| Speed: {currentFileSpeed}
+          {/if}
+        </span>
+      </div>
+      <div class="progress-bar-container overall-bar">
+        <div class="progress-bar" style="width: {overallPct}%"></div>
+        <span class="progress-text">{Math.round(overallPct)}%</span>
+      </div>
+    </div>
+  {/if}
 
   <footer>
     {#if processing}
@@ -581,6 +621,28 @@
     word-break: break-all;
     max-height: 60px;
     overflow-y: auto;
+  }
+
+  .overall-progress {
+    flex-shrink: 0;
+    background: #16213e;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .overall-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.85em;
+    margin-bottom: 6px;
+    color: #ccc;
+  }
+  .overall-stats {
+    color: #95d5b2;
+    font-size: 0.8em;
+  }
+  .overall-bar {
+    height: 22px;
   }
 
   footer {

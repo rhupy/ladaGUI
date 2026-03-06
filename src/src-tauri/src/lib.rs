@@ -23,10 +23,13 @@ pub struct LadaSettings {
 #[derive(Clone, Serialize)]
 struct ProgressPayload {
     file_index: usize,
+    total_files: usize,
     file_name: String,
     progress: f64,
     status: String,
     message: String,
+    remaining: String,
+    speed: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -127,6 +130,9 @@ async fn process_files(
     CANCEL_FLAG.store(false, Ordering::SeqCst);
 
     let progress_re = Regex::new(r"Processing video:\s+(\d+)%").unwrap();
+    let remaining_re = Regex::new(r"Remaining:\s*(\S+)").unwrap();
+    let speed_re = Regex::new(r"Speed:\s*(\S+)").unwrap();
+    let total_files = files.len();
 
     // Use system temp dir for temporary files
     let tmp_dir = std::env::temp_dir().join("lada-gui-tmp");
@@ -136,10 +142,13 @@ async fn process_files(
         if CANCEL_FLAG.load(Ordering::SeqCst) {
             let _ = app.emit("progress", ProgressPayload {
                 file_index: index,
+                total_files,
                 file_name: file_name_from_path(file_path),
                 progress: 0.0,
                 status: "cancelled".to_string(),
                 message: "Cancelled by user".to_string(),
+                remaining: String::new(),
+                speed: String::new(),
             });
             break;
         }
@@ -158,10 +167,13 @@ async fn process_files(
 
         let _ = app.emit("progress", ProgressPayload {
             file_index: index,
+            total_files,
             file_name: file_name.clone(),
             progress: 0.0,
             status: "processing".to_string(),
             message: "Starting...".to_string(),
+            remaining: String::new(),
+            speed: String::new(),
         });
 
         // Convert paths for Docker volume mounts
@@ -254,12 +266,21 @@ async fn process_files(
 
                             if let Some(caps) = progress_re_clone.captures(&line) {
                                 if let Ok(pct) = caps[1].parse::<f64>() {
+                                    let rem = remaining_re.captures(&line)
+                                        .map(|c| c[1].to_string())
+                                        .unwrap_or_default();
+                                    let spd = speed_re.captures(&line)
+                                        .map(|c| c[1].to_string())
+                                        .unwrap_or_default();
                                     let _ = app_clone.emit("progress", ProgressPayload {
                                         file_index: index,
+                                        total_files,
                                         file_name: file_name_clone.clone(),
                                         progress: pct,
                                         status: "processing".to_string(),
                                         message: extract_progress_detail(&line),
+                                        remaining: rem,
+                                        speed: spd,
                                     });
                                 }
                             }
@@ -287,10 +308,13 @@ async fn process_files(
 
         let _ = app.emit("progress", ProgressPayload {
             file_index: index,
+            total_files,
             file_name: file_name.clone(),
             progress: if status.success() { 100.0 } else { 0.0 },
             status: final_status,
             message: final_msg,
+            remaining: String::new(),
+            speed: String::new(),
         });
     }
 
