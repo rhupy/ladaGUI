@@ -12,7 +12,8 @@
 
   // Settings
   let detectionModel = $state("v4-accurate");
-  let maxClipLength = $state(180);
+  let maxClipLength = $state(300);
+  let encoder = $state("hevc_nvenc");
   let crf = $state(18);
   let preset = $state("medium");
   let prefix = $state("[nm]");
@@ -137,6 +138,7 @@
         settings: {
           detection_model: detectionModel,
           max_clip_length: maxClipLength,
+          encoder: encoder,
           crf: crf,
           preset: preset,
           prefix: prefix,
@@ -235,7 +237,16 @@
         />
       </div>
       <div class="setting-row">
-        <label>CRF (quality)</label>
+        <label>Encoder</label>
+        <select bind:value={encoder} disabled={processing}>
+          <option value="hevc_nvenc">hevc_nvenc (GPU, fast)</option>
+          <option value="h264_nvenc">h264_nvenc (GPU, fast)</option>
+          <option value="libx265">libx265 (CPU, smaller file)</option>
+          <option value="libx264">libx264 (CPU, compatible)</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <label>CRF / CQ (quality)</label>
         <input
           type="number"
           bind:value={crf}

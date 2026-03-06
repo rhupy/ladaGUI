@@ -2,18 +2,17 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use tauri::{DragDropEvent, Emitter, WebviewEvent};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::Command;
 
 static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
-static LAST_STDERR: Mutex<Option<String>> = Mutex::new(None);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LadaSettings {
     detection_model: String,
     max_clip_length: u32,
+    encoder: String,
     crf: u32,
     preset: String,
     prefix: String,
@@ -182,10 +181,13 @@ async fn process_files(
             let _ = Command::new("chmod").args(["777", &tmp_dir_docker]).output().await;
         }
 
-        let encoder_options = format!(
-            "-crf {} -preset {} -x265-params log_level=error",
-            settings.crf, settings.preset
-        );
+        // Build encoder options based on selected encoder
+        let encoder = &settings.encoder;
+        let encoder_options = if encoder == "hevc_nvenc" || encoder == "h264_nvenc" {
+            format!("-preset {} -cq {}", settings.preset, settings.crf)
+        } else {
+            format!("-crf {} -preset {} -x265-params log_level=error", settings.crf, settings.preset)
+        };
 
         let input_file_name = input_path.file_name().unwrap().to_string_lossy().to_string();
 
@@ -201,7 +203,7 @@ async fn process_files(
             "--temporary-directory", "/tmp",
             "--mosaic-detection-model", &settings.detection_model,
             "--max-clip-length", &settings.max_clip_length.to_string(),
-            "--encoder", "libx265",
+            "--encoder", encoder,
             "--encoder-options", &encoder_options,
         ]);
 
