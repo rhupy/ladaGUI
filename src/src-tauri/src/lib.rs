@@ -218,7 +218,7 @@ async fn process_files(
         let mut child = cmd.spawn().map_err(|e| format!("Failed to start Docker: {}", e))?;
 
         let stderr = child.stderr.take().unwrap();
-        let mut reader = BufReader::new(stderr).lines();
+        let mut reader = BufReader::new(stderr);
 
         let app_clone = app.clone();
         let file_name_clone = file_name.clone();
@@ -227,28 +227,46 @@ async fn process_files(
         // Collect stderr for error reporting
         let mut last_stderr_lines: Vec<String> = Vec::new();
 
-        while let Ok(Some(line)) = reader.next_line().await {
-            if CANCEL_FLAG.load(Ordering::SeqCst) {
-                let _ = child.kill().await;
-                break;
-            }
+        // Read byte-by-byte to handle \r (carriage return) progress updates
+        // Lada outputs "Processing video: XX%...\r" without newlines
+        let mut line_buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            match tokio::io::AsyncReadExt::read(&mut reader, &mut byte).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if byte[0] == b'\r' || byte[0] == b'\n' {
+                        if !line_buf.is_empty() {
+                            let line = String::from_utf8_lossy(&line_buf).to_string();
+                            line_buf.clear();
 
-            // Keep last 10 lines for error reporting
-            last_stderr_lines.push(line.clone());
-            if last_stderr_lines.len() > 10 {
-                last_stderr_lines.remove(0);
-            }
+                            if CANCEL_FLAG.load(Ordering::SeqCst) {
+                                let _ = child.kill().await;
+                                break;
+                            }
 
-            if let Some(caps) = progress_re_clone.captures(&line) {
-                if let Ok(pct) = caps[1].parse::<f64>() {
-                    let _ = app_clone.emit("progress", ProgressPayload {
-                        file_index: index,
-                        file_name: file_name_clone.clone(),
-                        progress: pct,
-                        status: "processing".to_string(),
-                        message: extract_progress_detail(&line),
-                    });
+                            last_stderr_lines.push(line.clone());
+                            if last_stderr_lines.len() > 10 {
+                                last_stderr_lines.remove(0);
+                            }
+
+                            if let Some(caps) = progress_re_clone.captures(&line) {
+                                if let Ok(pct) = caps[1].parse::<f64>() {
+                                    let _ = app_clone.emit("progress", ProgressPayload {
+                                        file_index: index,
+                                        file_name: file_name_clone.clone(),
+                                        progress: pct,
+                                        status: "processing".to_string(),
+                                        message: extract_progress_detail(&line),
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        line_buf.push(byte[0]);
+                    }
                 }
+                Err(_) => break,
             }
         }
 
