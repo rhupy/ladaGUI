@@ -56,7 +56,12 @@
 
     listen("files-dropped", (event) => {
       addFilePaths(event.payload.paths);
+      dragging = false;
     });
+
+    listen("tauri://drag-enter", () => { dragging = true; });
+    listen("tauri://drag-leave", () => { dragging = false; });
+    listen("tauri://drag-drop", () => { dragging = false; });
   });
 
   async function checkDocker() {
@@ -544,9 +549,10 @@
     font-size: 0.75em;
     color: #888;
     margin-top: 4px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 60px;
+    overflow-y: auto;
   }
 
   footer {
