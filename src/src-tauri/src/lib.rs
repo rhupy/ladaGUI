@@ -19,6 +19,7 @@ pub struct LadaSettings {
     same_directory: bool,
     output_directory: String,
     delete_original: bool,
+    shutdown_after: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -48,7 +49,7 @@ async fn check_docker() -> Result<String, String> {
 
     if output.status.success() {
         let gpu_output = Command::new("docker")
-            .args(["run", "--rm", "--gpus", "all", "ladaapp/lada:latest", "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
+            .args(["run", "--rm", "--gpus", "all", "-e", "NVIDIA_DRIVER_CAPABILITIES=all", "ladaapp/lada:latest", "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
             .output()
             .await;
 
@@ -344,6 +345,14 @@ async fn process_files(
             remaining: String::new(),
             speed: String::new(),
         });
+    }
+
+    // Shutdown PC after all files processed
+    if settings.shutdown_after && !CANCEL_FLAG.load(Ordering::SeqCst) {
+        #[cfg(windows)]
+        { let _ = std::process::Command::new("shutdown").args(["/s", "/f", "/t", "10"]).spawn(); }
+        #[cfg(not(windows))]
+        { let _ = std::process::Command::new("shutdown").args(["-h", "now"]).spawn(); }
     }
 
     Ok(())

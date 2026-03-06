@@ -25,6 +25,7 @@
   let sameDirectory = $state(true);
   let outputDirectory = $state("");
   let deleteOriginal = $state(true);
+  let shutdownAfter = $state(false);
 
   // Settings panel toggle
   let showSettings = $state(false);
@@ -163,6 +164,7 @@
           same_directory: sameDirectory,
           output_directory: outputDirectory,
           delete_original: deleteOriginal,
+          shutdown_after: shutdownAfter,
         },
       });
     } catch (e) {
@@ -297,6 +299,16 @@
             disabled={processing}
           />
           Delete original after success
+        </label>
+      </div>
+      <div class="setting-row">
+        <label>
+          <input
+            type="checkbox"
+            bind:checked={shutdownAfter}
+            disabled={processing}
+          />
+          Shutdown PC after completion
         </label>
       </div>
       <div class="setting-row">
