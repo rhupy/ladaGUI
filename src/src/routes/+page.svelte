@@ -22,6 +22,22 @@
   // Settings panel toggle
   let showSettings = $state(false);
 
+  const VIDEO_EXTENSIONS = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts"];
+
+  function addFilePaths(paths) {
+    for (const path of paths) {
+      const ext = path.split(".").pop()?.toLowerCase();
+      if (!ext || !VIDEO_EXTENSIONS.includes(ext)) continue;
+      const name = path.split(/[/\\]/).pop();
+      if (!files.find((f) => f.path === path)) {
+        files = [
+          ...files,
+          { path, name, progress: 0, status: "pending", message: "" },
+        ];
+      }
+    }
+  }
+
   onMount(async () => {
     await checkDocker();
 
@@ -36,6 +52,10 @@
           message: p.message,
         };
       }
+    });
+
+    listen("files-dropped", (event) => {
+      addFilePaths(event.payload.paths);
     });
   });
 
@@ -56,22 +76,13 @@
       filters: [
         {
           name: "Video",
-          extensions: ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts"],
+          extensions: VIDEO_EXTENSIONS,
         },
       ],
     });
     if (selected) {
       const paths = Array.isArray(selected) ? selected : [selected];
-      for (const p of paths) {
-        const path = typeof p === "string" ? p : p.path;
-        const name = path.split(/[/\\]/).pop();
-        if (!files.find((f) => f.path === path)) {
-          files = [
-            ...files,
-            { path, name, progress: 0, status: "pending", message: "" },
-          ];
-        }
-      }
+      addFilePaths(paths.map((p) => (typeof p === "string" ? p : p.path)));
     }
   }
 
@@ -159,26 +170,7 @@
     return "#888";
   }
 
-  function handleDrop(e) {
-    e.preventDefault();
-    const items = e.dataTransfer?.files;
-    if (items) {
-      for (const file of items) {
-        const path = file.path || file.name;
-        const name = path.split(/[/\\]/).pop();
-        if (!files.find((f) => f.path === path)) {
-          files = [
-            ...files,
-            { path, name, progress: 0, status: "pending", message: "" },
-          ];
-        }
-      }
-    }
-  }
-
-  function handleDragOver(e) {
-    e.preventDefault();
-  }
+  let dragging = $state(false);
 </script>
 
 <main>
@@ -274,9 +266,8 @@
 
   <div
     class="file-list"
+    class:dragging
     role="list"
-    ondrop={handleDrop}
-    ondragover={handleDragOver}
   >
     {#if files.length === 0}
       <div class="empty-state">
@@ -468,6 +459,11 @@
     border-radius: 8px;
     padding: 8px;
     min-height: 120px;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .file-list.dragging {
+    border-color: #e94560;
+    background: rgba(233, 69, 96, 0.05);
   }
 
   .empty-state {

@@ -2,7 +2,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::Emitter;
+use tauri::{DragDropEvent, Emitter, WebviewEvent};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -273,6 +273,11 @@ fn extract_progress_detail(line: &str) -> String {
     }
 }
 
+#[derive(Clone, Serialize)]
+struct DroppedFiles {
+    paths: Vec<String>,
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -285,6 +290,15 @@ pub fn run() {
             process_files,
             cancel_processing,
         ])
+        .on_webview_event(|webview, event| {
+            if let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
+                let file_paths: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| p.to_str().map(|s| s.to_string()))
+                    .collect();
+                let _ = webview.emit("files-dropped", DroppedFiles { paths: file_paths });
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
