@@ -132,7 +132,7 @@
   }
 
   function clearDone() {
-    files = files.filter((f) => f.status !== "done" && f.status !== "error");
+    files = files.filter((f) => f.status === "pending");
   }
 
   async function startProcessing() {
