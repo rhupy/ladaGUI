@@ -57,7 +57,6 @@
     });
     document.addEventListener("drop", (e) => {
       e.preventDefault();
-      e.stopPropagation();
       dragging = false;
     });
     document.addEventListener("dragleave", (e) => {
@@ -90,9 +89,15 @@
       dragging = false;
     });
 
+    // tauri://drag-drop contains paths directly from OS native drag
+    listen("tauri://drag-drop", (event) => {
+      dragging = false;
+      if (event.payload?.paths) {
+        addFilePaths(event.payload.paths);
+      }
+    });
     listen("tauri://drag-enter", () => { dragging = true; });
     listen("tauri://drag-leave", () => { dragging = false; });
-    listen("tauri://drag-drop", () => { dragging = false; });
   });
 
   async function checkDocker() {
