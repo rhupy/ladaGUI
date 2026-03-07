@@ -26,6 +26,7 @@
   let outputDirectory = $state("");
   let deleteOriginal = $state(true);
   let shutdownAfter = $state(false);
+  let parallelJobs = $state(1);
 
   // Settings panel toggle
   let showSettings = $state(false);
@@ -168,6 +169,7 @@
           output_directory: outputDirectory,
           delete_original: deleteOriginal,
           shutdown_after: shutdownAfter,
+          parallel_jobs: parallelJobs,
         },
       });
     } catch (e) {
@@ -260,6 +262,16 @@
           max="600"
           disabled={processing}
         />
+      </div>
+      <div class="setting-row">
+        <label>Parallel Jobs</label>
+        <select bind:value={parallelJobs} disabled={processing}>
+          <option value={1}>1 (sequential)</option>
+          <option value={2}>2</option>
+          <option value={3}>3</option>
+          <option value={4}>4</option>
+        </select>
+        <span class="hint">VRAM usage × N</span>
       </div>
       <div class="setting-row">
         <label>Encoder</label>
