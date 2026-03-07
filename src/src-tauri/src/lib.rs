@@ -256,12 +256,34 @@ async fn process_files(
 
         // Read byte-by-byte to handle \r (carriage return) progress updates
         // Lada outputs "Processing video: XX%...\r" without newlines
+        // Timeout: if no output for 10 minutes, kill the process
+        let read_timeout = std::time::Duration::from_secs(600);
         let mut line_buf = Vec::new();
         loop {
             let mut byte = [0u8; 1];
-            match tokio::io::AsyncReadExt::read(&mut reader, &mut byte).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {
+            let read_result = tokio::time::timeout(
+                read_timeout,
+                tokio::io::AsyncReadExt::read(&mut reader, &mut byte),
+            ).await;
+            match read_result {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Err(_)) => break, // Read error
+                Err(_) => {
+                    // Timeout - no output for 10 minutes, kill process
+                    let _ = child.kill().await;
+                    let _ = app_clone.emit("progress", ProgressPayload {
+                        file_index: index,
+                        total_files,
+                        file_name: file_name_clone.clone(),
+                        progress: 0.0,
+                        status: "error".to_string(),
+                        message: "Process timed out (no output for 10 minutes)".to_string(),
+                        remaining: String::new(),
+                        speed: String::new(),
+                    });
+                    break;
+                }
+                Ok(Ok(_)) => {
                     if byte[0] == b'\r' || byte[0] == b'\n' {
                         if !line_buf.is_empty() {
                             let line = String::from_utf8_lossy(&line_buf).to_string();
@@ -302,7 +324,6 @@ async fn process_files(
                         line_buf.push(byte[0]);
                     }
                 }
-                Err(_) => break,
             }
         }
 
