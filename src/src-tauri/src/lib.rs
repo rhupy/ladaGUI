@@ -60,17 +60,12 @@ async fn check_docker() -> Result<String, String> {
         .map_err(|e| format!("Docker not found: {}", e))?;
 
     if output.status.success() {
-        let gpu_output = Command::new("docker")
-            .args(["run", "--rm", "--gpus", "all", "-e", "NVIDIA_DRIVER_CAPABILITIES=all", "ladaapp/lada:latest", "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
-            .output()
-            .await;
-
-        match gpu_output {
-            Ok(o) if o.status.success() => {
-                let gpu_name = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                Ok(format!("Docker OK, GPU: {}", gpu_name))
-            }
-            _ => Ok("Docker OK, GPU: not detected".to_string()),
+        let info_str = String::from_utf8_lossy(&output.stdout);
+        let has_nvidia = info_str.contains("nvidia") || info_str.contains("NVIDIA");
+        if has_nvidia {
+            Ok("Docker OK, GPU: NVIDIA".to_string())
+        } else {
+            Ok("Docker OK, GPU: not detected".to_string())
         }
     } else {
         Err("Docker is not running".to_string())
