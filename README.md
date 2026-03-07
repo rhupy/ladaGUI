@@ -1,51 +1,53 @@
 # Lada GUI
 
-AI 기반 동영상 모자이크 제거 도구 [Lada](https://github.com/ladaapp/lada)의 GUI 래퍼 애플리케이션.
+**[한국어](README.ko.md)** | English
 
-Tauri + Svelte로 구현된 경량 데스크탑 앱 (~2.6MB)으로, Docker에서 Lada를 실행하고 진행률을 실시간으로 표시합니다.
+A lightweight GUI wrapper for [Lada](https://github.com/ladaapp/lada), an AI-based video mosaic removal tool.
+
+Built with Tauri + Svelte (~2.6MB installer). Runs Lada via Docker and displays real-time progress.
 
 ## Screenshots
 
-| 파일 추가 | 병렬 처리 중 | 설정 |
+| File Queue | Parallel Processing | Settings |
 |:-:|:-:|:-:|
-| ![GUI](.github/GUI.png) | ![구동화면](.github/구동화면.png) | ![세팅](.github/세팅.png) |
+| ![GUI](.github/GUI.png) | ![Processing](.github/구동화면.png) | ![Settings](.github/세팅.png) |
 
 ## Features
 
-- 파일 드래그앤드롭 / 추가 버튼으로 작업 큐 관리
-- 실시간 프로그레스바 (잔여시간, 속도 표시)
-- GPU 인코딩 (NVENC) 지원 - CPU 부하 최소화
-- 병렬 처리 (동시 1~4개 파일)
-- 실패 시 자동 재시도 (무한, 로그 기록)
-- 완료 후 원본 삭제 옵션
-- 완료 후 PC 자동 종료 옵션
-- 출력 경로 / 파일명 접두사 설정
-- Lada Docker 이미지 원클릭 업데이트
+- Drag & drop or browse to add video files
+- Real-time progress bar with ETA and speed
+- GPU encoding (NVENC) - minimal CPU load
+- Parallel processing (1~4 simultaneous files)
+- Auto-retry on failure (infinite, with logging)
+- Delete original after success
+- Auto shutdown PC after completion
+- Custom output path / filename prefix
+- One-click Lada Docker image update
 
-## 사전 준비 (필수)
+## Prerequisites
 
-### 1. NVIDIA GPU 드라이버
+### 1. NVIDIA GPU Driver
 
-NVIDIA GPU가 필요합니다. 최신 드라이버를 설치하세요.
+An NVIDIA GPU is required. Install the latest driver.
 
-- [NVIDIA 드라이버 다운로드](https://www.nvidia.com/Download/index.aspx)
-- 드라이버 버전 570.0 이상 권장 (NVENC 지원)
+- [NVIDIA Driver Download](https://www.nvidia.com/Download/index.aspx)
+- Driver version 570.0+ recommended (NVENC support)
 
-### 2. Docker Desktop 설치
+### 2. Docker Desktop
 
-Docker Desktop이 필요합니다. Lada는 Docker 컨테이너로 실행됩니다.
+Lada runs inside a Docker container.
 
-1. [Docker Desktop](https://www.docker.com/products/docker-desktop/) 다운로드 및 설치
-2. 설치 시 **WSL 2 backend** 사용 (기본값)
-3. 설치 후 Docker Desktop 실행
+1. Download and install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+2. Use **WSL 2 backend** during installation (default)
+3. Launch Docker Desktop after installation
 
-### 3. Docker Desktop GPU 설정
+### 3. Docker Desktop GPU Setup
 
-Docker에서 GPU를 사용하려면 추가 설정이 필요합니다.
+GPU access in Docker requires additional configuration.
 
-1. Docker Desktop 실행
-2. Settings > Resources > WSL Integration 에서 사용 중인 WSL 배포판 활성화
-3. Settings > Docker Engine 에서 아래 내용이 있는지 확인:
+1. Open Docker Desktop
+2. Settings > Resources > WSL Integration - enable your WSL distro
+3. Settings > Docker Engine - verify the following exists:
    ```json
    {
      "runtimes": {
@@ -56,52 +58,50 @@ Docker에서 GPU를 사용하려면 추가 설정이 필요합니다.
      }
    }
    ```
-   없다면 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) 설치가 필요합니다.
+   If missing, install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
-### 4. Lada Docker 이미지 다운로드
+### 4. Pull Lada Docker Image
 
-첫 실행 전에 Lada 이미지를 미리 받아두면 좋습니다 (~14GB):
+Pre-download the Lada image (~14GB):
 
 ```bash
 docker pull ladaapp/lada:latest
 ```
 
-또는 앱 내 **Update Lada** 버튼으로도 다운로드 가능합니다.
+Or use the **Update Lada** button in the app.
 
-### 5. GPU 동작 확인 (선택)
-
-설정이 올바른지 확인:
+### 5. Verify GPU Access (Optional)
 
 ```bash
 docker run --rm --gpus all ladaapp/lada:latest nvidia-smi
 ```
 
-GPU 정보가 표시되면 정상입니다.
+If GPU info is displayed, you're good to go.
 
-## 설치 및 실행
+## Installation
 
-1. [Releases](https://github.com/rhupy/lada/releases)에서 `Lada GUI_x.x.x_x64-setup.exe` 다운로드
-2. 설치 후 실행
-3. 우측 상단에 `Docker OK, GPU: NVIDIA` 표시 확인
-4. 동영상 파일을 드래그하거나 Add Files로 추가
-5. Start Processing 클릭
+1. Download `Lada GUI_x.x.x_x64-setup.exe` from [Releases](https://github.com/rhupy/lada/releases)
+2. Install and launch
+3. Verify `Docker OK, GPU: NVIDIA` in the top-right corner
+4. Drag video files or click Add Files
+5. Click Start Processing
 
-## Settings 설명
+## Settings
 
-| 설정 | 기본값 | 설명 |
-|------|--------|------|
-| Detection Model | v4-accurate | `v4-fast`: 빠름, `v4-accurate`: 정확함 |
-| Max Clip Length | 300 | 긴 영상을 N초 단위로 분할 처리 (VRAM 부족 시 줄이기) |
-| Parallel Jobs | 1 | 동시 처리 파일 수 (VRAM 여유 시 2~4) |
-| Encoder | hevc_nvenc | GPU 인코딩. GPU 없으면 `libx265` 선택 |
-| CRF / CQ | 18 | 품질 (낮을수록 고품질, 큰 파일) |
-| Preset | medium | 인코딩 속도 vs 품질 |
-| Filename Prefix | [nm] | 출력 파일명 앞에 붙는 접두사 |
-| Delete original | On | 성공 시 원본 파일 삭제 |
-| Shutdown after | Off | 모든 파일 완료 후 PC 종료 |
-| Output to same directory | On | 원본과 같은 폴더에 출력 |
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Detection Model | v4-accurate | `v4-fast`: faster, `v4-accurate`: better quality |
+| Max Clip Length | 300 | Split long videos into N-second segments (reduce if VRAM is low) |
+| Parallel Jobs | 1 | Simultaneous files (increase with VRAM headroom, 2~4) |
+| Encoder | hevc_nvenc | GPU encoding. Use `libx265` if no GPU |
+| CRF / CQ | 18 | Quality (lower = better quality, larger file) |
+| Preset | medium | Encoding speed vs quality tradeoff |
+| Filename Prefix | [nm] | Prefix added to output filename |
+| Delete original | On | Delete source file after successful processing |
+| Shutdown after | Off | Shutdown PC after all files complete |
+| Output to same directory | On | Save output in same folder as source |
 
-## 권장 설정 (GPU별)
+## Recommended Settings by GPU
 
 ### RTX 5090 / 4090 (VRAM 24~32GB)
 - Parallel Jobs: 2~4
@@ -113,34 +113,34 @@ GPU 정보가 표시되면 정상입니다.
 - Encoder: hevc_nvenc
 - Max Clip Length: 120~300
 
-### GPU 없음 / 저사양
+### No GPU / Low-end
 - Parallel Jobs: 1
 - Encoder: libx265
 - Max Clip Length: 60~120
 
-## 로그
+## Logs
 
-처리 실패/재시도 로그는 앱 설치 경로의 `lada-gui.log`에 기록됩니다.
+Failure/retry logs are saved to `lada-gui.log` in the app installation directory.
 
-## 문제 해결
+## Troubleshooting
 
 ### "Docker OK, GPU: not detected"
-- Docker Desktop이 실행 중인지 확인
-- NVIDIA 드라이버가 설치되어 있는지 확인
-- Docker Desktop 재시작 후 다시 시도
+- Ensure Docker Desktop is running
+- Verify NVIDIA driver is installed
+- Restart Docker Desktop and try again
 
-### 처리 시작 후 바로 실패 (exit code 125)
-- Docker Desktop의 GPU 지원이 활성화되어 있는지 확인
-- `docker run --rm --gpus all ladaapp/lada:latest nvidia-smi` 테스트
+### Immediate failure on start (exit code 125)
+- Check if GPU support is enabled in Docker Desktop
+- Test with: `docker run --rm --gpus all ladaapp/lada:latest nvidia-smi`
 
-### hevc_nvenc 인코더 오류
-- Encoder를 `libx265`로 변경하여 테스트
-- NVIDIA 드라이버 570.0 이상 필요
+### hevc_nvenc encoder error
+- Switch Encoder to `libx265` as a fallback
+- NVIDIA driver 570.0+ is required for NVENC
 
-### 처리 중 멈춤
-- 앱은 프로세스가 살아있는 한 무한 대기합니다
-- Cancel 후 다시 시작해보세요
-- 재시도 시 자동으로 처리됩니다
+### Processing hangs
+- The app waits indefinitely as long as the process is alive
+- Try Cancel and restart
+- Failed processes are automatically retried
 
 ## Tech Stack
 
