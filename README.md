@@ -4,6 +4,12 @@ AI 기반 동영상 모자이크 제거 도구 [Lada](https://github.com/ladaapp
 
 Tauri + Svelte로 구현된 경량 데스크탑 앱 (~2.6MB)으로, Docker에서 Lada를 실행하고 진행률을 실시간으로 표시합니다.
 
+## Screenshots
+
+| 파일 추가 | 병렬 처리 중 | 설정 |
+|:-:|:-:|:-:|
+| ![GUI](.github/GUI.png) | ![구동화면](.github/구동화면.png) | ![세팅](.github/세팅.png) |
+
 ## Features
 
 - 파일 드래그앤드롭 / 추가 버튼으로 작업 큐 관리
