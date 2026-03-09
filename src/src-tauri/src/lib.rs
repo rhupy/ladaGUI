@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::io::Write;
-use tauri::{DragDropEvent, Emitter, WebviewEvent};
+use tauri::{DragDropEvent, Emitter, Manager, WebviewEvent};
 use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -93,19 +93,81 @@ async fn update_lada() -> Result<String, String> {
 #[tauri::command]
 async fn cancel_processing() -> Result<(), String> {
     CANCEL_FLAG.store(true, Ordering::SeqCst);
-    let _ = Command::new("docker")
+    // Stop ALL running lada containers (fixes #14: multiple parallel jobs)
+    if let Ok(output) = Command::new("docker")
         .args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest"])
         .output()
         .await
-        .map(|output| {
-            let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !container_id.is_empty() {
+    {
+        let ids = String::from_utf8_lossy(&output.stdout);
+        for id in ids.lines() {
+            let id = id.trim();
+            if !id.is_empty() {
                 let _ = std::process::Command::new("docker")
-                    .args(["stop", &container_id])
+                    .args(["stop", id])
                     .spawn();
             }
-        });
+        }
+    }
     Ok(())
+}
+
+#[tauri::command]
+async fn pause_processing() -> Result<(), String> {
+    if let Ok(output) = Command::new("docker")
+        .args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest"])
+        .output()
+        .await
+    {
+        let ids = String::from_utf8_lossy(&output.stdout);
+        for id in ids.lines() {
+            let id = id.trim();
+            if !id.is_empty() {
+                let _ = Command::new("docker").args(["pause", id]).output().await;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn resume_processing() -> Result<(), String> {
+    if let Ok(output) = Command::new("docker")
+        .args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest", "--filter", "status=paused"])
+        .output()
+        .await
+    {
+        let ids = String::from_utf8_lossy(&output.stdout);
+        for id in ids.lines() {
+            let id = id.trim();
+            if !id.is_empty() {
+                let _ = Command::new("docker").args(["unpause", id]).output().await;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_settings(app: tauri::AppHandle, settings: LadaSettings) -> Result<(), String> {
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("settings.json");
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn load_settings(app: tauri::AppHandle) -> Result<Option<LadaSettings>, String> {
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let path = dir.join("settings.json");
+    if path.exists() {
+        let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let settings: LadaSettings = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        Ok(Some(settings))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Convert a native OS path to Docker volume mount format.
@@ -351,7 +413,7 @@ async fn process_files(
     CANCEL_FLAG.store(false, Ordering::SeqCst);
 
     let total_files = files.len();
-    let parallel = (settings.parallel_jobs.max(1).min(8)) as usize;
+    let parallel = (settings.parallel_jobs.max(1).min(99)) as usize;
     let shutdown_after = settings.shutdown_after;
     let semaphore = Arc::new(Semaphore::new(parallel));
 
@@ -422,6 +484,10 @@ pub fn run() {
             update_lada,
             process_files,
             cancel_processing,
+            pause_processing,
+            resume_processing,
+            save_settings,
+            load_settings,
         ])
         .on_webview_event(|webview, event| {
             if let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
