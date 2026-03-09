@@ -1,6 +1,6 @@
 # Lada GUI
 
-**[한국어](README.ko.md)** | English
+**[한국어](README.ko.md)** | English | [![Discord](https://img.shields.io/badge/Discord-Join-7289da?logo=discord&logoColor=white)](https://discord.gg/px4vBjTUBg)
 
 A lightweight GUI wrapper for [Lada](https://github.com/ladaapp/lada), an AI-based video mosaic removal tool.
 

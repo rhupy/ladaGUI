@@ -1,6 +1,6 @@
 # Lada GUI
 
-한국어 | **[English](README.md)**
+한국어 | **[English](README.md)** | [![Discord](https://img.shields.io/badge/Discord-참여-7289da?logo=discord&logoColor=white)](https://discord.gg/px4vBjTUBg)
 
 AI 기반 동영상 모자이크 제거 도구 [Lada](https://github.com/ladaapp/lada)의 GUI 래퍼 애플리케이션.
 
