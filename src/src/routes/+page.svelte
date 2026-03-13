@@ -47,7 +47,7 @@
   let errorCount = $state(0);
 
   // Performance
-  let perfData = $state({ cpuUsage: 0, gpuUsage: 0, vramUsage: 0, vramTotal: 0 });
+  let perfData = $state({ cpuUsage: 0, ramUsed: 0, ramTotal: 0, ramPercent: 0, gpuUsage: 0, vramUsage: 0, vramTotal: 0, gpuTemp: 0, gpuPower: 0 });
   let perfInterval = null;
 
   const VIDEO_EXTENSIONS = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts"];
@@ -389,8 +389,36 @@
     }
   }
 
+  async function fetchPerfData() {
+    try {
+      const stats = await invoke("get_system_stats");
+      perfData = {
+        cpuUsage: Math.round(stats.cpu_usage),
+        ramUsed: stats.ram_used,
+        ramTotal: stats.ram_total,
+        ramPercent: Math.round(stats.ram_percent),
+        gpuUsage: stats.gpu_usage,
+        vramUsage: stats.vram_used,
+        vramTotal: stats.vram_total,
+        gpuTemp: stats.gpu_temp,
+        gpuPower: stats.gpu_power,
+      };
+    } catch (e) {
+      console.error("Perf fetch error:", e);
+    }
+  }
+
   function togglePanel(panel) {
     activePanel = activePanel === panel ? null : panel;
+    // Start/stop perf polling
+    if (perfInterval) {
+      clearInterval(perfInterval);
+      perfInterval = null;
+    }
+    if (activePanel === "performance") {
+      fetchPerfData();
+      perfInterval = setInterval(fetchPerfData, 1500);
+    }
   }
 
   function statusIcon(status) {
@@ -607,10 +635,17 @@
         </div>
       </div>
       <div class="perf-row">
+        <span class="perf-label">RAM</span>
+        <div class="perf-bar-container">
+          <div class="perf-bar ram-bar" style="width: {perfData.ramPercent}%"></div>
+          <span class="perf-value">{(perfData.ramUsed / 1024).toFixed(1)} / {(perfData.ramTotal / 1024).toFixed(1)} GB ({perfData.ramPercent}%)</span>
+        </div>
+      </div>
+      <div class="perf-row">
         <span class="perf-label">{t.gpuUsage}</span>
         <div class="perf-bar-container">
           <div class="perf-bar gpu-bar" style="width: {perfData.gpuUsage}%"></div>
-          <span class="perf-value">{perfData.gpuUsage}%</span>
+          <span class="perf-value">{perfData.gpuUsage}%{perfData.gpuTemp > 0 ? ` | ${perfData.gpuTemp}°C` : ''}{perfData.gpuPower > 0 ? ` | ${perfData.gpuPower.toFixed(0)}W` : ''}</span>
         </div>
       </div>
       <div class="perf-row">
@@ -620,7 +655,6 @@
           <span class="perf-value">{perfData.vramUsage} / {perfData.vramTotal} MB</span>
         </div>
       </div>
-      <p class="perf-note">{lang === "ko" ? "성능 모니터링은 향후 업데이트에서 실시간으로 제공됩니다" : "Real-time monitoring coming in a future update"}</p>
     </div>
   {/if}
 
@@ -1094,6 +1128,7 @@
     transition: width 0.5s;
   }
   .cpu-bar { background: #2196f3; }
+  .ram-bar { background: #ab47bc; }
   .gpu-bar { background: #e94560; }
   .vram-bar { background: #ff9800; }
   .perf-value {

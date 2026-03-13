@@ -9,7 +9,87 @@ use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
+use sysinfo::System;
+use std::sync::Mutex;
+
 static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
+
+static SYS_INFO: std::sync::LazyLock<Mutex<System>> = std::sync::LazyLock::new(|| {
+    let mut sys = System::new_all();
+    sys.refresh_cpu_all();
+    sys.refresh_memory();
+    Mutex::new(sys)
+});
+
+#[derive(Clone, Serialize)]
+struct SystemStats {
+    cpu_usage: f32,
+    ram_used: u64,
+    ram_total: u64,
+    ram_percent: f32,
+    gpu_usage: u32,
+    vram_used: u64,
+    vram_total: u64,
+    gpu_temp: u32,
+    gpu_power: f32,
+}
+
+#[tauri::command]
+async fn get_system_stats() -> Result<SystemStats, String> {
+    // CPU & RAM via sysinfo
+    let (cpu_usage, ram_used, ram_total) = {
+        let mut sys = SYS_INFO.lock().unwrap();
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        let cpu = sys.global_cpu_usage();
+        let used = sys.used_memory();
+        let total = sys.total_memory();
+        (cpu, used, total)
+    };
+
+    let ram_percent = if ram_total > 0 {
+        (ram_used as f64 / ram_total as f64 * 100.0) as f32
+    } else {
+        0.0
+    };
+
+    // GPU via nvidia-smi
+    let (gpu_usage, vram_used, vram_total, gpu_temp, gpu_power) =
+        match tokio::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw", "--format=csv,noheader,nounits"])
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                let s = String::from_utf8_lossy(&output.stdout);
+                let parts: Vec<&str> = s.trim().split(',').map(|p| p.trim()).collect();
+                if parts.len() >= 5 {
+                    (
+                        parts[0].parse::<u32>().unwrap_or(0),
+                        parts[1].parse::<u64>().unwrap_or(0),
+                        parts[2].parse::<u64>().unwrap_or(0),
+                        parts[3].parse::<u32>().unwrap_or(0),
+                        parts[4].parse::<f32>().unwrap_or(0.0),
+                    )
+                } else {
+                    (0, 0, 0, 0, 0.0)
+                }
+            }
+            _ => (0, 0, 0, 0, 0.0),
+        };
+
+    Ok(SystemStats {
+        cpu_usage,
+        ram_used: ram_used / (1024 * 1024), // bytes → MB
+        ram_total: ram_total / (1024 * 1024),
+        ram_percent,
+        gpu_usage,
+        vram_used,
+        vram_total,
+        gpu_temp,
+        gpu_power,
+    })
+}
 
 fn write_log(msg: &str) {
     let log_path = std::env::current_exe()
@@ -488,6 +568,7 @@ pub fn run() {
             resume_processing,
             save_settings,
             load_settings,
+            get_system_stats,
         ])
         .on_webview_event(|webview, event| {
             if let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
