@@ -474,12 +474,12 @@
           <option value="v4-fast">v4-fast</option>
           <option value="v4-accurate">v4-accurate</option>
         </select>
-        <span class="tooltip-icon" title={tooltips.detectionModel}>?</span>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.detectionModel}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.maxClipLength}</label>
         <input type="number" bind:value={maxClipLength} min="30" max="600" disabled={processing} onchange={persistSettings} />
-        <span class="tooltip-icon" title={tooltips.maxClipLength}>?</span>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.maxClipLength}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.parallelJobsLabel}</label>
@@ -501,7 +501,7 @@
           />
           <button class="spin-btn" onclick={() => { if (parallelJobs < 99) { parallelJobs++; persistSettings(); } }} disabled={processing}>+</button>
         </div>
-        <span class="tooltip-icon" title={tooltips.parallelJobs}>?</span>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.parallelJobs}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.encoderLabel}</label>
@@ -511,12 +511,12 @@
           <option value="libx265">libx265 (CPU)</option>
           <option value="libx264">libx264 (CPU)</option>
         </select>
-        <span class="tooltip-icon" title={tooltips.encoder}>?</span>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.encoder}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.crfLabel}</label>
         <input type="number" bind:value={crf} min="0" max="51" disabled={processing} onchange={persistSettings} />
-        <span class="tooltip-icon" title={tooltips.crf}>?</span>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.crf}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.presetLabel}</label>
@@ -527,7 +527,7 @@
           <option value="slow">slow</option>
           <option value="veryslow">veryslow</option>
         </select>
-        <span class="tooltip-icon" title={tooltips.preset}>?</span>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.preset}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.prefixLabel}</label>
@@ -565,7 +565,7 @@
           <input type="checkbox" bind:checked={watermarkEnabled} disabled={processing} onchange={persistSettings} />
           {t.watermark}
         </label>
-        <span class="tooltip-icon" title={tooltips.watermark}>?</span>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.watermark}</span></span>
       </div>
       {#if watermarkEnabled}
         <div class="setting-row sub-setting">
@@ -949,6 +949,11 @@
     flex: 1;
   }
 
+  .tooltip-wrap {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+  }
   .tooltip-icon {
     display: inline-flex;
     align-items: center;
@@ -961,8 +966,29 @@
     font-size: 0.7em;
     font-weight: bold;
     cursor: help;
-    flex-shrink: 0;
+  }
+  .tooltip-text {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #222;
+    color: #ddd;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 0.78em;
+    line-height: 1.5;
     white-space: pre-line;
+    min-width: 200px;
+    max-width: 300px;
+    z-index: 100;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    pointer-events: none;
+  }
+  .tooltip-wrap:hover .tooltip-text {
+    display: block;
   }
 
   .number-spinner {
