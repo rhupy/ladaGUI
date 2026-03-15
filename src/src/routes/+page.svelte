@@ -207,6 +207,25 @@
 
     await checkDocker();
 
+    // Position tooltips dynamically (fixed positioning)
+    document.addEventListener("mouseenter", (e) => {
+      const wrap = e.target.closest?.(".tooltip-wrap");
+      if (!wrap) return;
+      const tip = wrap.querySelector(".tooltip-text");
+      if (!tip) return;
+      const rect = wrap.getBoundingClientRect();
+      tip.style.left = rect.left + rect.width / 2 + "px";
+      tip.style.transform = "translateX(-50%)";
+      // Show below if too close to top, otherwise above
+      if (rect.top < 120) {
+        tip.style.top = rect.bottom + 8 + "px";
+        tip.style.bottom = "auto";
+      } else {
+        tip.style.bottom = window.innerHeight - rect.top + 8 + "px";
+        tip.style.top = "auto";
+      }
+    }, true);
+
     document.addEventListener("dragover", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -351,6 +370,13 @@
     paused = false;
     addLogEntry(`--- ${lang === "ko" ? "작업 완료" : "Processing finished"} ---`);
     saveLogs();
+
+    // Check shutdown toggle at completion time (not at start time)
+    if (shutdownAfter) {
+      addLogEntry(`[SHUTDOWN] ${lang === "ko" ? "10초 후 PC를 종료합니다..." : "Shutting down PC in 10 seconds..."}`);
+      saveLogs();
+      await invoke("shutdown_pc");
+    }
   }
 
   async function cancelProcessing() {
@@ -645,13 +671,6 @@
           </select>
         </div>
       {/if}
-      <div class="setting-row">
-        <label>{t.languageLabel}</label>
-        <select value={lang} onchange={(e) => setLang(e.target.value)}>
-          <option value="en">English</option>
-          <option value="ko">한국어</option>
-        </select>
-      </div>
     </div>
   {/if}
 
@@ -1033,10 +1052,7 @@
   }
   .tooltip-text {
     display: none;
-    position: absolute;
-    bottom: calc(100% + 8px);
-    left: 50%;
-    transform: translateX(-50%);
+    position: fixed;
     background: #222;
     color: #ddd;
     border: 1px solid #555;
@@ -1047,7 +1063,7 @@
     white-space: pre-line;
     min-width: 200px;
     max-width: 300px;
-    z-index: 100;
+    z-index: 99999;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
     pointer-events: none;
   }

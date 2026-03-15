@@ -9,6 +9,29 @@ use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
+/// Apply CREATE_NO_WINDOW flag on Windows to prevent console window flashing
+#[cfg(windows)]
+fn hide_window(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000)
+}
+
+#[cfg(not(windows))]
+fn hide_window(cmd: &mut Command) -> &mut Command {
+    cmd
+}
+
+#[cfg(windows)]
+fn hide_window_std(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000)
+}
+
+#[cfg(not(windows))]
+fn hide_window_std(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
+}
+
 use sysinfo::System;
 use std::sync::Mutex;
 
@@ -57,11 +80,7 @@ async fn get_system_stats() -> Result<SystemStats, String> {
     let (gpu_usage, vram_used, vram_total, gpu_temp, gpu_power) = {
         let mut cmd = tokio::process::Command::new("nvidia-smi");
         cmd.args(["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw", "--format=csv,noheader,nounits"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
+        hide_window(&mut cmd);
         match cmd.output().await
         {
             Ok(output) if output.status.success() => {
@@ -145,10 +164,10 @@ struct DroppedFiles {
 
 #[tauri::command]
 async fn check_docker() -> Result<String, String> {
-    let output = Command::new("docker")
-        .args(["info"])
-        .output()
-        .await
+    let mut cmd = Command::new("docker");
+    cmd.args(["info"]);
+    hide_window(&mut cmd);
+    let output = cmd.output().await
         .map_err(|e| format!("Docker not found: {}", e))?;
 
     if output.status.success() {
@@ -166,10 +185,10 @@ async fn check_docker() -> Result<String, String> {
 
 #[tauri::command]
 async fn update_lada() -> Result<String, String> {
-    let output = Command::new("docker")
-        .args(["pull", "ladaapp/lada:latest"])
-        .output()
-        .await
+    let mut cmd = Command::new("docker");
+    cmd.args(["pull", "ladaapp/lada:latest"]);
+    hide_window(&mut cmd);
+    let output = cmd.output().await
         .map_err(|e| format!("Failed to pull: {}", e))?;
 
     if output.status.success() {
@@ -183,18 +202,18 @@ async fn update_lada() -> Result<String, String> {
 async fn cancel_processing() -> Result<(), String> {
     CANCEL_FLAG.store(true, Ordering::SeqCst);
     // Stop ALL running lada containers (fixes #14: multiple parallel jobs)
-    if let Ok(output) = Command::new("docker")
-        .args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest"])
-        .output()
-        .await
-    {
+    let mut cmd = Command::new("docker");
+    cmd.args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest"]);
+    hide_window(&mut cmd);
+    if let Ok(output) = cmd.output().await {
         let ids = String::from_utf8_lossy(&output.stdout);
         for id in ids.lines() {
             let id = id.trim();
             if !id.is_empty() {
-                let _ = std::process::Command::new("docker")
-                    .args(["stop", id])
-                    .spawn();
+                let mut stop_cmd = std::process::Command::new("docker");
+                stop_cmd.args(["stop", id]);
+                hide_window_std(&mut stop_cmd);
+                let _ = stop_cmd.spawn();
             }
         }
     }
@@ -203,16 +222,18 @@ async fn cancel_processing() -> Result<(), String> {
 
 #[tauri::command]
 async fn pause_processing() -> Result<(), String> {
-    if let Ok(output) = Command::new("docker")
-        .args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest"])
-        .output()
-        .await
-    {
+    let mut cmd = Command::new("docker");
+    cmd.args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest"]);
+    hide_window(&mut cmd);
+    if let Ok(output) = cmd.output().await {
         let ids = String::from_utf8_lossy(&output.stdout);
         for id in ids.lines() {
             let id = id.trim();
             if !id.is_empty() {
-                let _ = Command::new("docker").args(["pause", id]).output().await;
+                let mut pause_cmd = Command::new("docker");
+                pause_cmd.args(["pause", id]);
+                hide_window(&mut pause_cmd);
+                let _ = pause_cmd.output().await;
             }
         }
     }
@@ -221,16 +242,18 @@ async fn pause_processing() -> Result<(), String> {
 
 #[tauri::command]
 async fn resume_processing() -> Result<(), String> {
-    if let Ok(output) = Command::new("docker")
-        .args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest", "--filter", "status=paused"])
-        .output()
-        .await
-    {
+    let mut cmd = Command::new("docker");
+    cmd.args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest", "--filter", "status=paused"]);
+    hide_window(&mut cmd);
+    if let Ok(output) = cmd.output().await {
         let ids = String::from_utf8_lossy(&output.stdout);
         for id in ids.lines() {
             let id = id.trim();
             if !id.is_empty() {
-                let _ = Command::new("docker").args(["unpause", id]).output().await;
+                let mut unpause_cmd = Command::new("docker");
+                unpause_cmd.args(["unpause", id]);
+                hide_window(&mut unpause_cmd);
+                let _ = unpause_cmd.output().await;
             }
         }
     }
@@ -371,12 +394,7 @@ async fn process_single_file(
         cmd.args(&arg_refs);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
+        hide_window(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -510,7 +528,6 @@ async fn process_files(
 
     let total_files = files.len();
     let parallel = (settings.parallel_jobs.max(1).min(99)) as usize;
-    let shutdown_after = settings.shutdown_after;
     let semaphore = Arc::new(Semaphore::new(parallel));
 
     let mut handles = Vec::new();
@@ -543,14 +560,20 @@ async fn process_files(
         let _ = handle.await;
     }
 
-    // Shutdown PC after all files processed
-    if shutdown_after && !CANCEL_FLAG.load(Ordering::SeqCst) {
-        #[cfg(windows)]
-        { let _ = std::process::Command::new("shutdown").args(["/s", "/f", "/t", "10"]).spawn(); }
-        #[cfg(not(windows))]
-        { let _ = std::process::Command::new("shutdown").args(["-h", "now"]).spawn(); }
-    }
+    Ok(())
+}
 
+#[tauri::command]
+async fn shutdown_pc() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let mut sd = std::process::Command::new("shutdown");
+        sd.args(["/s", "/f", "/t", "10"]);
+        hide_window_std(&mut sd);
+        let _ = sd.spawn();
+    }
+    #[cfg(not(windows))]
+    { let _ = std::process::Command::new("shutdown").args(["-h", "now"]).spawn(); }
     Ok(())
 }
 
@@ -607,6 +630,7 @@ pub fn run() {
             save_settings,
             load_settings,
             get_system_stats,
+            shutdown_pc,
         ])
         .setup(|app| {
             // Handle CLI args on first launch
