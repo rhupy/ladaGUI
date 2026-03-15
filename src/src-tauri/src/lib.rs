@@ -115,7 +115,11 @@ pub struct LadaSettings {
     delete_original: bool,
     shutdown_after: bool,
     parallel_jobs: u32,
+    #[serde(default = "default_memory_limit")]
+    memory_limit: u32, // GB per container, 0 = unlimited
 }
+
+fn default_memory_limit() -> u32 { 10 }
 
 #[derive(Clone, Serialize)]
 struct ProgressPayload {
@@ -327,8 +331,15 @@ async fn process_single_file(
 
     let input_file_name = input_path.file_name().unwrap().to_string_lossy().to_string();
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
+    ];
+    // Memory limit per container (prevents heap corruption / segfault)
+    if settings.memory_limit > 0 {
+        args.push("--memory".into());
+        args.push(format!("{}g", settings.memory_limit));
+    }
+    args.extend([
         "-v".into(), format!("{}:/input", input_dir_docker),
         "-v".into(), format!("{}:/output", output_dir_docker),
         "-v".into(), format!("{}:/tmp", tmp_dir_docker),
@@ -341,7 +352,7 @@ async fn process_single_file(
         "--max-clip-length".into(), settings.max_clip_length.to_string(),
         "--encoder".into(), encoder.clone(),
         "--encoder-options".into(), encoder_options.clone(),
-    ];
+    ]);
 
     // Retry loop: on failure, log error and retry indefinitely until cancel
     let mut attempt = 0u32;

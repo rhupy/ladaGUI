@@ -29,6 +29,7 @@
   let deleteOriginal = $state(true);
   let shutdownAfter = $state(false);
   let parallelJobs = $state(1);
+  let memoryLimit = $state(10);
 
   // Watermark settings
   let watermarkEnabled = $state(false);
@@ -75,6 +76,7 @@
     detectionModel: lang === "ko" ? "감지 모델" : "Detection Model",
     maxClipLength: lang === "ko" ? "최대 클립 길이" : "Max Clip Length",
     parallelJobsLabel: lang === "ko" ? "병렬 작업 수" : "Parallel Jobs",
+    memoryLimitLabel: lang === "ko" ? "컨테이너 메모리" : "Memory Limit",
     encoderLabel: lang === "ko" ? "인코더" : "Encoder",
     crfLabel: lang === "ko" ? "CRF / CQ (품질)" : "CRF / CQ (quality)",
     presetLabel: lang === "ko" ? "프리셋" : "Preset",
@@ -105,6 +107,9 @@
     parallelJobs: lang === "ko"
       ? "동시 처리 영상 수. VRAM 사용량 × N\n\nRTX 3060 12GB: 1~2개\nRTX 3080/4070: 2~3개\nRTX 4080/4090: 3~6개\nRTX 5090: 4~8개"
       : "Number of concurrent videos. VRAM usage × N\n\nRTX 3060 12GB: 1-2\nRTX 3080/4070: 2-3\nRTX 4080/4090: 3-6\nRTX 5090: 4-8",
+    memoryLimit: lang === "ko"
+      ? "컨테이너당 최대 RAM (GB)\n메모리 부족 시 exit 137로 안전하게 종료 후 재시도\n0 = 무제한\n\n64GB RAM 기준:\n잡 2~3개: 16GB\n잡 4~5개: 10GB\n잡 6개 이상: 8GB"
+      : "Max RAM per container (GB)\nPrevents crash (exit 139) by clean OOM kill (137) + retry\n0 = unlimited\n\n64GB RAM:\n2-3 jobs: 16GB\n4-5 jobs: 10GB\n6+ jobs: 8GB",
     encoder: lang === "ko"
       ? "hevc_nvenc/h264_nvenc: GPU 인코딩 (빠름)\nlibx265/libx264: CPU 인코딩 (파일 작음)"
       : "hevc_nvenc/h264_nvenc: GPU encoding (fast)\nlibx265/libx264: CPU encoding (smaller file)",
@@ -132,6 +137,7 @@
       delete_original: deleteOriginal,
       shutdown_after: shutdownAfter,
       parallel_jobs: parallelJobs,
+      memory_limit: memoryLimit,
     };
   }
 
@@ -179,6 +185,7 @@
         deleteOriginal = saved.delete_original ?? deleteOriginal;
         shutdownAfter = saved.shutdown_after ?? shutdownAfter;
         parallelJobs = saved.parallel_jobs ?? parallelJobs;
+        memoryLimit = saved.memory_limit ?? memoryLimit;
       }
     } catch (e) {
       console.log("No saved settings found");
@@ -530,6 +537,29 @@
           <button class="spin-btn" onclick={() => { if (parallelJobs < 99) { parallelJobs++; persistSettings(); } }} disabled={processing}>+</button>
         </div>
         <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.parallelJobs}</span></span>
+      </div>
+      <div class="setting-row">
+        <label>{t.memoryLimitLabel}</label>
+        <div class="number-spinner">
+          <button class="spin-btn" onclick={() => { if (memoryLimit > 0) { memoryLimit--; persistSettings(); } }} disabled={processing}>-</button>
+          <input
+            type="number"
+            bind:value={memoryLimit}
+            min="0"
+            max="128"
+            disabled={processing}
+            onchange={(e) => {
+              let v = parseInt(e.target.value) || 0;
+              if (v < 0) v = 0;
+              if (v > 128) v = 128;
+              memoryLimit = v;
+              persistSettings();
+            }}
+          />
+          <button class="spin-btn" onclick={() => { if (memoryLimit < 128) { memoryLimit++; persistSettings(); } }} disabled={processing}>+</button>
+        </div>
+        <span class="mem-unit">GB</span>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.memoryLimit}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.encoderLabel}</label>
@@ -1051,6 +1081,10 @@
     border: 1px solid #444;
     background: #0f0f23;
     color: #eee;
+  }
+  .mem-unit {
+    font-size: 0.8em;
+    color: #888;
   }
   .spin-btn:first-child {
     border-radius: 4px 0 0 4px;
