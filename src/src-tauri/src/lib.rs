@@ -564,9 +564,31 @@ fn extract_progress_detail(line: &str) -> String {
     }
 }
 
+fn filter_video_paths(args: &[String]) -> Vec<String> {
+    let video_exts = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts"];
+    args.iter()
+        .filter(|a| {
+            let lower = a.to_lowercase();
+            video_exts.iter().any(|ext| lower.ends_with(&format!(".{}", ext)))
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // Second instance launched with file args → send to existing instance
+            let paths = filter_video_paths(&argv);
+            if !paths.is_empty() {
+                let _ = app.emit("files-dropped", DroppedFiles { paths });
+            }
+            // Focus the existing window
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
@@ -581,6 +603,20 @@ pub fn run() {
             load_settings,
             get_system_stats,
         ])
+        .setup(|app| {
+            // Handle CLI args on first launch
+            let args: Vec<String> = std::env::args().collect();
+            let paths = filter_video_paths(&args);
+            if !paths.is_empty() {
+                let app_handle = app.handle().clone();
+                // Delay to ensure frontend is ready
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let _ = app_handle.emit("files-dropped", DroppedFiles { paths });
+                });
+            }
+            Ok(())
+        })
         .on_webview_event(|webview, event| {
             if let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
                 let file_paths: Vec<String> = paths
