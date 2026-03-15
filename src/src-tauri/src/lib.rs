@@ -54,11 +54,15 @@ async fn get_system_stats() -> Result<SystemStats, String> {
     };
 
     // GPU via nvidia-smi
-    let (gpu_usage, vram_used, vram_total, gpu_temp, gpu_power) =
-        match tokio::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw", "--format=csv,noheader,nounits"])
-            .output()
-            .await
+    let (gpu_usage, vram_used, vram_total, gpu_temp, gpu_power) = {
+        let mut cmd = tokio::process::Command::new("nvidia-smi");
+        cmd.args(["--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw", "--format=csv,noheader,nounits"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        match cmd.output().await
         {
             Ok(output) if output.status.success() => {
                 let s = String::from_utf8_lossy(&output.stdout);
@@ -76,7 +80,8 @@ async fn get_system_stats() -> Result<SystemStats, String> {
                 }
             }
             _ => (0, 0, 0, 0, 0.0),
-        };
+        }
+    };
 
     Ok(SystemStats {
         cpu_usage,
