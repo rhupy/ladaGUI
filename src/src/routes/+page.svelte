@@ -13,9 +13,9 @@
   let updating = $state(false);
 
   // Overall progress tracking
-  let currentFileRemaining = $state("");
   let currentFileSpeed = $state("");
   let totalFiles = $state(0);
+  let cancelled = $state(false);
 
   // Settings
   let detectionModel = $state("v4-accurate");
@@ -70,7 +70,6 @@
     dragDrop: lang === "ko" ? "여기에 동영상 파일을 끌어다 놓거나, '파일 추가'를 클릭하세요" : 'Drag & drop video files here, or click "Add Files"',
     files: lang === "ko" ? "파일" : "files",
     overall: lang === "ko" ? "전체" : "Overall",
-    remaining: lang === "ko" ? "남은 시간" : "Remaining",
     speed: lang === "ko" ? "속도" : "Speed",
     shutdownAfterDone: lang === "ko" ? "완료 후 PC 종료" : "Shutdown after done",
     detectionModel: lang === "ko" ? "감지 모델" : "Detection Model",
@@ -251,18 +250,15 @@
         };
       }
       totalFiles = p.total_files || files.length;
-      if (p.remaining) currentFileRemaining = p.remaining;
       if (p.speed) currentFileSpeed = p.speed;
 
       // Log events
       if (p.status === "done") {
         addLogEntry(`[DONE] ${p.file_name}: ${p.message}`);
-        currentFileRemaining = "";
         currentFileSpeed = "";
       }
       if (p.status === "error") {
         addLogEntry(`[ERROR] ${p.file_name}: ${p.message}`, "error");
-        currentFileRemaining = "";
         currentFileSpeed = "";
       }
       if (p.message && p.message.startsWith("Attempt") && p.message.includes("Retrying")) {
@@ -348,6 +344,7 @@
 
     processing = true;
     paused = false;
+    cancelled = false;
     errorCount = 0;
 
     pendingIndices = files
@@ -371,8 +368,8 @@
     addLogEntry(`--- ${lang === "ko" ? "작업 완료" : "Processing finished"} ---`);
     saveLogs();
 
-    // Check shutdown toggle at completion time (not at start time)
-    if (shutdownAfter) {
+    // Check shutdown toggle at completion time, but not if cancelled
+    if (shutdownAfter && !cancelled) {
       addLogEntry(`[SHUTDOWN] ${lang === "ko" ? "10초 후 PC를 종료합니다..." : "Shutting down PC in 10 seconds..."}`);
       saveLogs();
       await invoke("shutdown_pc");
@@ -381,6 +378,7 @@
 
   async function cancelProcessing() {
     try {
+      cancelled = true;
       await invoke("cancel_processing");
       addLogEntry(`[CANCEL] ${lang === "ko" ? "사용자가 취소함" : "Cancelled by user"}`);
     } catch (e) {
@@ -748,27 +746,20 @@
               <button class="remove-btn" onclick={() => removeFile(index)}>×</button>
             {/if}
           </div>
-          {#if file.status === "processing" || file.status === "done"}
-            <div class="progress-bar-container">
+          <div class="progress-bar-container">
+            {#if file.status === "processing" || file.status === "done"}
               <div
                 class="progress-bar"
                 class:done={file.status === "done"}
                 style="width: {file.progress}%"
               ></div>
               <span class="progress-text">{Math.round(file.progress)}%</span>
-            </div>
-            {#if file.status === "processing" && currentFileRemaining && currentFileRemaining !== "?"}
-              <div class="progress-meta">
-                <span>{t.remaining}: {currentFileRemaining}</span>
-                {#if currentFileSpeed && currentFileSpeed !== "?"}
-                  <span>{t.speed}: {currentFileSpeed}</span>
-                {/if}
-              </div>
             {/if}
-          {/if}
-          {#if file.message}
-            <div class="file-message">{file.message}</div>
-          {/if}
+          </div>
+          <div class="file-bottom">
+            <span class="file-message">{file.message || ""}</span>
+            <span class="file-speed">{#if file.status === "processing" && currentFileSpeed && currentFileSpeed !== "?"}{t.speed}: {currentFileSpeed}{/if}</span>
+          </div>
         </div>
       {/each}
     {/if}
@@ -783,11 +774,8 @@
       <div class="overall-header">
         <span>{t.overall}: {doneCount}/{totalFiles} {t.files}</span>
         <span class="overall-stats">
-          {#if currentFileRemaining && currentFileRemaining !== "?"}
-            {t.remaining}: {currentFileRemaining}
-          {/if}
           {#if currentFileSpeed && currentFileSpeed !== "?"}
-            &nbsp;| {t.speed}: {currentFileSpeed}
+            {t.speed}: {currentFileSpeed}
           {/if}
         </span>
       </div>
@@ -1225,6 +1213,37 @@
     margin-bottom: 4px;
     background: #16213e;
     border-radius: 6px;
+    height: 72px;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+  }
+
+  .file-bottom {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.75em;
+    color: #888;
+    margin-top: auto;
+    min-height: 16px;
+  }
+
+  .file-bottom .file-message {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin: 0;
+    padding: 0;
+    font-size: inherit;
+    color: inherit;
+  }
+
+  .file-bottom .file-speed {
+    flex-shrink: 0;
+    margin-left: 8px;
+    font-variant-numeric: tabular-nums;
   }
 
   .file-header {
@@ -1286,25 +1305,6 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .progress-meta {
-    display: flex;
-    justify-content: flex-end;
-    gap: 16px;
-    font-size: 0.72em;
-    color: #888;
-    margin-top: 3px;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .file-message {
-    font-size: 0.75em;
-    color: #888;
-    margin-top: 4px;
-    white-space: pre-wrap;
-    word-break: break-all;
-    max-height: 60px;
-    overflow-y: auto;
-  }
 
   .overall-progress {
     flex-shrink: 0;
