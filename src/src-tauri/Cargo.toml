@@ -1,6 +1,6 @@
 [package]
 name = "lada-gui"
-version = "0.3.3"
+version = "0.4.0"
 description = "GUI for Lada mosaic removal"
 authors = ["rhupy"]
 edition = "2021"

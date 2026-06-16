@@ -3,7 +3,11 @@
   import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import { open as shellOpen } from "@tauri-apps/plugin-shell";
+  import { getVersion } from "@tauri-apps/api/app";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
+
+  let appVersion = $state("");
 
   let files = $state([]);
   let dockerStatus = $state("Checking...");
@@ -19,6 +23,8 @@
 
   // Settings
   let detectionModel = $state("v4-accurate");
+  let restorationModel = $state("basicvsrpp-v1.2");
+  let fp16 = $state("auto"); // "auto" | "on" | "off"
   let maxClipLength = $state(300);
   let encoder = $state("hevc_nvenc");
   let crf = $state(18);
@@ -71,8 +77,14 @@
     files: lang === "ko" ? "파일" : "files",
     overall: lang === "ko" ? "전체" : "Overall",
     speed: lang === "ko" ? "속도" : "Speed",
+    remaining: lang === "ko" ? "남은시간" : "Remaining",
     shutdownAfterDone: lang === "ko" ? "완료 후 PC 종료" : "Shutdown after done",
     detectionModel: lang === "ko" ? "감지 모델" : "Detection Model",
+    restorationModel: lang === "ko" ? "복원 모델" : "Restoration Model",
+    fp16Label: lang === "ko" ? "FP16 (반정밀도)" : "FP16 (half precision)",
+    fp16Auto: lang === "ko" ? "자동" : "Auto",
+    fp16On: lang === "ko" ? "켜기" : "On",
+    fp16Off: lang === "ko" ? "끄기" : "Off",
     maxClipLength: lang === "ko" ? "최대 클립 길이" : "Max Clip Length",
     parallelJobsLabel: lang === "ko" ? "병렬 작업 수" : "Parallel Jobs",
     memoryLimitLabel: lang === "ko" ? "컨테이너 메모리" : "Memory Limit",
@@ -100,6 +112,12 @@
     detectionModel: lang === "ko"
       ? "v4-fast: 빠르지만 정확도 낮음\nv4-accurate: 느리지만 정확도 높음"
       : "v4-fast: Faster but less accurate\nv4-accurate: Slower but better quality",
+    restorationModel: lang === "ko"
+      ? "모자이크를 실제로 복원하는 모델 (화질의 핵심)\n\nbasicvsrpp-v1.2: 최신·권장\nv1.1 / v1.0: 구버전\n\n* Docker 이미지에 포함된 모델만 동작합니다"
+      : "Model that actually restores the mosaic (the core of quality)\n\nbasicvsrpp-v1.2: Latest, recommended\nv1.1 / v1.0: Older versions\n\n* Only models bundled in the Docker image will work",
+    fp16: lang === "ko"
+      ? "반정밀도 연산. VRAM 절약 + 최신 GPU에서 속도 향상\n화질 차이는 거의 없음\n\n자동: GPU 지원 여부를 Lada가 판단 (권장)\n켜기: 강제 사용 (구형 GPU는 실패할 수 있음)\n끄기: 강제 비활성 (FP32)"
+      : "Half-precision compute. Saves VRAM + faster on modern GPUs\nNegligible quality difference\n\nAuto: Let Lada decide based on GPU (recommended)\nOn: Force enable (may fail on old GPUs)\nOff: Force disable (FP32)",
     maxClipLength: lang === "ko"
       ? "영상을 분할 처리하는 최대 길이(초)\nVRAM 부족 시 낮추세요"
       : "Max segment length in seconds\nLower if running out of VRAM",
@@ -126,6 +144,8 @@
   function getSettingsObj() {
     return {
       detection_model: detectionModel,
+      restoration_model: restorationModel,
+      fp16,
       max_clip_length: maxClipLength,
       encoder,
       crf,
@@ -148,7 +168,7 @@
       if (!files.find((f) => f.path === path)) {
         files = [
           ...files,
-          { path, name, progress: 0, status: "pending", message: "" },
+          { path, name, progress: 0, status: "pending", message: "", remaining: "", speed: "" },
         ];
       }
     }
@@ -169,11 +189,21 @@
   }
 
   onMount(async () => {
+    // App version → header + OS window title
+    try {
+      appVersion = await getVersion();
+      await getCurrentWindow().setTitle(`Lada GUI v${appVersion} - Mosaic Removal`);
+    } catch (e) {
+      console.error("Failed to get app version:", e);
+    }
+
     // Load saved settings
     try {
       const saved = await invoke("load_settings");
       if (saved) {
         detectionModel = saved.detection_model ?? detectionModel;
+        restorationModel = saved.restoration_model ?? restorationModel;
+        fp16 = saved.fp16 ?? fp16;
         maxClipLength = saved.max_clip_length ?? maxClipLength;
         encoder = saved.encoder ?? encoder;
         crf = saved.crf ?? crf;
@@ -241,12 +271,16 @@
     listen("progress", (event) => {
       const p = event.payload;
       const idx = pendingIndices?.[p.file_index] ?? p.file_index;
+      const finished = p.status === "done" || p.status === "error" || p.status === "cancelled";
       if (idx < files.length) {
         files[idx] = {
           ...files[idx],
           progress: p.progress,
           status: p.status,
           message: p.message,
+          // Per-file stats (cleared once the file is no longer processing)
+          remaining: finished ? "" : (p.remaining ?? ""),
+          speed: finished ? "" : (p.speed ?? ""),
         };
       }
       totalFiles = p.total_files || files.length;
@@ -480,7 +514,7 @@
 <main>
   <header>
     <div class="header-left">
-      <h1>Lada GUI</h1>
+      <h1>Lada GUI{#if appVersion}<span class="app-version">v{appVersion}</span>{/if}</h1>
       <a
         class="discord-link"
         href="#"
@@ -534,6 +568,24 @@
           <option value="v4-accurate">v4-accurate</option>
         </select>
         <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.detectionModel}</span></span>
+      </div>
+      <div class="setting-row">
+        <label>{t.restorationModel}</label>
+        <select bind:value={restorationModel} disabled={processing} onchange={persistSettings}>
+          <option value="basicvsrpp-v1.2">basicvsrpp-v1.2 ({lang === "ko" ? "권장" : "recommended"})</option>
+          <option value="basicvsrpp-v1.1">basicvsrpp-v1.1</option>
+          <option value="basicvsrpp-v1.0">basicvsrpp-v1.0</option>
+        </select>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.restorationModel}</span></span>
+      </div>
+      <div class="setting-row">
+        <label>{t.fp16Label}</label>
+        <select bind:value={fp16} disabled={processing} onchange={persistSettings}>
+          <option value="auto">{t.fp16Auto}</option>
+          <option value="on">{t.fp16On}</option>
+          <option value="off">{t.fp16Off}</option>
+        </select>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.fp16}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.maxClipLength}</label>
@@ -758,7 +810,13 @@
           </div>
           <div class="file-bottom">
             <span class="file-message">{file.message || ""}</span>
-            <span class="file-speed">{#if file.status === "processing" && currentFileSpeed && currentFileSpeed !== "?"}{t.speed}: {currentFileSpeed}{/if}</span>
+            <span class="file-stats">
+              {#if file.status === "processing"}
+                {#if file.remaining && file.remaining !== "?"}{t.remaining}: {file.remaining}{/if}
+                {#if file.remaining && file.remaining !== "?" && file.speed && file.speed !== "?"}&nbsp;·&nbsp;{/if}
+                {#if file.speed && file.speed !== "?"}{t.speed}: {file.speed}{/if}
+              {/if}
+            </span>
           </div>
         </div>
       {/each}
@@ -870,6 +928,15 @@
     margin: 0;
     font-size: 1.4em;
     color: #e94560;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+  .app-version {
+    font-size: 0.5em;
+    font-weight: 500;
+    color: #888;
+    font-variant-numeric: tabular-nums;
   }
 
   .discord-link {
@@ -1226,11 +1293,15 @@
     font-size: 0.75em;
     color: #888;
     margin-top: auto;
-    min-height: 16px;
+    /* Always reserve exactly one line so the card height never changes */
+    height: 16px;
+    line-height: 16px;
+    overflow: hidden;
   }
 
   .file-bottom .file-message {
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1240,9 +1311,10 @@
     color: inherit;
   }
 
-  .file-bottom .file-speed {
-    flex-shrink: 0;
+  .file-bottom .file-stats {
+    flex: 0 0 auto;
     margin-left: 8px;
+    white-space: nowrap;
     font-variant-numeric: tabular-nums;
   }
 

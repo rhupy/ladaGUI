@@ -129,6 +129,10 @@ fn write_log(msg: &str) {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LadaSettings {
     detection_model: String,
+    #[serde(default = "default_restoration_model")]
+    restoration_model: String,
+    #[serde(default = "default_fp16")]
+    fp16: String, // "auto" | "on" | "off"
     max_clip_length: u32,
     encoder: String,
     crf: u32,
@@ -144,6 +148,8 @@ pub struct LadaSettings {
 }
 
 fn default_memory_limit() -> u32 { 10 }
+fn default_restoration_model() -> String { "basicvsrpp-v1.2".to_string() }
+fn default_fp16() -> String { "auto".to_string() }
 
 #[derive(Clone, Serialize)]
 struct ProgressPayload {
@@ -377,10 +383,17 @@ async fn process_single_file(
         "--output".into(), format!("/output/{}", output_filename),
         "--temporary-directory".into(), "/tmp".into(),
         "--mosaic-detection-model".into(), settings.detection_model.clone(),
+        "--mosaic-restoration-model".into(), settings.restoration_model.clone(),
         "--max-clip-length".into(), settings.max_clip_length.to_string(),
         "--encoder".into(), encoder.clone(),
         "--encoder-options".into(), encoder_options.clone(),
     ]);
+    // FP16: "auto" lets Lada decide based on GPU capabilities; otherwise force on/off
+    match settings.fp16.as_str() {
+        "on" => args.push("--fp16".into()),
+        "off" => args.push("--no-fp16".into()),
+        _ => {}
+    }
 
     // Retry loop: on failure, log error and retry indefinitely until cancel
     let mut attempt = 0u32;
@@ -585,11 +598,21 @@ fn file_name_from_path(path: &str) -> String {
 }
 
 fn extract_progress_detail(line: &str) -> String {
-    if let Some(pos) = line.find("Processed:") {
-        line[pos..].to_string()
-    } else {
-        line.to_string()
-    }
+    // Take everything from "Processed:" onward...
+    let detail = match line.find("Processed:") {
+        Some(pos) => &line[pos..],
+        None => line,
+    };
+    // ...but stop before "Remaining"/"Speed" — those are emitted in dedicated fields
+    // so the left-hand label shows only the processed count.
+    let cut = detail
+        .find("Remaining")
+        .or_else(|| detail.find("Speed"))
+        .unwrap_or(detail.len());
+    detail[..cut]
+        .trim()
+        .trim_end_matches(|c: char| c == ',' || c == '|' || c == '[' || c.is_whitespace())
+        .to_string()
 }
 
 fn filter_video_paths(args: &[String]) -> Vec<String> {
