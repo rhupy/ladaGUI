@@ -313,6 +313,459 @@ fn to_docker_volume_path(path: &str) -> String {
     }
 }
 
+/// Build the `docker run ... ladaapp/lada` argument vector for one Lada job.
+/// Mounts are parameterized so the same builder serves the normal 2D path
+/// (input dir / output dir separate) and the VR sub-passes (all pointing at /tmp).
+fn build_lada_args(
+    input_dir_docker: &str,
+    output_dir_docker: &str,
+    tmp_dir_docker: &str,
+    input_file_name: &str,
+    output_filename: &str,
+    settings: &LadaSettings,
+) -> Vec<String> {
+    let encoder = &settings.encoder;
+    let encoder_options = if encoder == "hevc_nvenc" || encoder == "h264_nvenc" {
+        format!("-preset {} -cq {}", settings.preset, settings.crf)
+    } else {
+        format!("-crf {} -preset {} -x265-params log_level=error", settings.crf, settings.preset)
+    };
+
+    let mut args: Vec<String> = vec![
+        "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
+    ];
+    // Memory limit per container (prevents heap corruption / segfault)
+    if settings.memory_limit > 0 {
+        args.push("--memory".into());
+        args.push(format!("{}g", settings.memory_limit));
+    }
+    args.extend([
+        "-v".into(), format!("{}:/input", input_dir_docker),
+        "-v".into(), format!("{}:/output", output_dir_docker),
+        "-v".into(), format!("{}:/tmp", tmp_dir_docker),
+        "-e".into(), "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility".into(),
+        "ladaapp/lada:latest".into(),
+        "--input".into(), format!("/input/{}", input_file_name),
+        "--output".into(), format!("/output/{}", output_filename),
+        "--temporary-directory".into(), "/tmp".into(),
+        "--mosaic-detection-model".into(), settings.detection_model.clone(),
+        "--mosaic-restoration-model".into(), settings.restoration_model.clone(),
+        "--max-clip-length".into(), settings.max_clip_length.to_string(),
+        "--encoder".into(), encoder.clone(),
+        "--encoder-options".into(), encoder_options.clone(),
+    ]);
+    // FP16: "auto" lets Lada decide based on GPU capabilities; otherwise force on/off
+    match settings.fp16.as_str() {
+        "on" => args.push("--fp16".into()),
+        "off" => args.push("--no-fp16".into()),
+        _ => {}
+    }
+    args
+}
+
+/// Probe (width, height, duration_seconds) of the first video stream using
+/// ffprobe *inside* the lada docker image (so the host needs no ffmpeg).
+async fn docker_probe_dims(input_dir_docker: &str, input_file_name: &str) -> Option<(u32, u32, f64)> {
+    let args: Vec<String> = vec![
+        "run".into(), "--rm".into(),
+        "-v".into(), format!("{}:/input", input_dir_docker),
+        "--entrypoint".into(), "ffprobe".into(),
+        "ladaapp/lada:latest".into(),
+        "-v".into(), "error".into(),
+        "-select_streams".into(), "v:0".into(),
+        "-show_entries".into(), "stream=width,height".into(),
+        "-show_entries".into(), "format=duration".into(),
+        "-of".into(), "default=noprint_wrappers=1:nokey=1".into(),
+        format!("/input/{}", input_file_name),
+    ];
+    let mut cmd = Command::new("docker");
+    cmd.args(&args);
+    hide_window(&mut cmd);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() { return None; }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let nums: Vec<&str> = s.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if nums.len() < 2 { return None; }
+    let w = nums[0].parse::<u32>().ok()?;
+    let h = nums[1].parse::<u32>().ok()?;
+    let dur = nums.get(2).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    Some((w, h, dur))
+}
+
+/// Average SSIM between the left and right halves over ~10 frames sampled at
+/// `seek_sec`, computed via ffmpeg inside the lada image. A true side-by-side
+/// stereo pair scores high (~0.6 on real VR here); unrelated 2D halves score low.
+async fn docker_lr_ssim(input_dir_docker: &str, input_file_name: &str, seek_sec: f64) -> Option<f64> {
+    let filter = "[0:v]crop=iw/2:ih:0:0,scale=256:256,format=gray[l];\
+[0:v]crop=iw/2:ih:iw/2:0,scale=256:256,format=gray[r];[l][r]ssim".to_string();
+    let args: Vec<String> = vec![
+        "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
+        "-v".into(), format!("{}:/input", input_dir_docker),
+        "--entrypoint".into(), "ffmpeg".into(),
+        "ladaapp/lada:latest".into(),
+        "-nostdin".into(),
+        "-ss".into(), format!("{:.3}", seek_sec),
+        "-i".into(), format!("/input/{}", input_file_name),
+        "-an".into(),
+        "-frames:v".into(), "10".into(),
+        "-filter_complex".into(), filter,
+        "-f".into(), "null".into(), "-".into(),
+    ];
+    let mut cmd = Command::new("docker");
+    cmd.args(&args);
+    hide_window(&mut cmd);
+    let out = cmd.output().await.ok()?;
+    let s = String::from_utf8_lossy(&out.stderr);
+    // ffmpeg's ssim filter logs "... All:<avg> (..)" to stderr at EOF.
+    let re = Regex::new(r"All:([0-9.]+)").ok()?;
+    let mut last: Option<f64> = None;
+    for cap in re.captures_iter(&s) {
+        if let Ok(v) = cap[1].parse::<f64>() { last = Some(v); }
+    }
+    last
+}
+
+/// Auto-detect a left/right split (SBS) VR video. Two-stage gate keeps the
+/// common 2D case cheap: a non-2:1 aspect exits immediately after one probe;
+/// only ~2:1 candidates pay for the extra SSIM sample.
+async fn detect_sbs_vr(input_dir_docker: &str, input_file_name: &str) -> bool {
+    let (w, h, dur) = match docker_probe_dims(input_dir_docker, input_file_name).await {
+        Some(v) => v,
+        None => return false,
+    };
+    if h == 0 { return false; }
+    let ratio = w as f64 / h as f64;
+    // 180° SBS is ~2:1 (two near-square eyes). Excludes 16:9 (1.78) and 2.39 scope.
+    if !(ratio > 1.9 && ratio < 2.1) { return false; }
+    let seek = if dur > 20.0 { dur / 2.0 } else { 0.0 };
+    match docker_lr_ssim(input_dir_docker, input_file_name, seek).await {
+        Some(score) => {
+            let is_vr = score >= 0.40;
+            write_log(&format!("VR-DETECT file=\"{}\" {}x{} ratio={:.3} ssim={:.3} -> {}",
+                input_file_name, w, h, ratio, score, if is_vr { "VR(SBS)" } else { "2D" }));
+            is_vr
+        }
+        None => false,
+    }
+}
+
+/// Split the input into /tmp/vr_left.mp4 and /tmp/vr_right.mp4 in a single
+/// decode pass (NVENC, high quality, no audio), via ffmpeg inside the image.
+async fn docker_split_lr(input_dir_docker: &str, tmp_dir_docker: &str, input_file_name: &str) -> Result<(), String> {
+    let args: Vec<String> = vec![
+        "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
+        "-e".into(), "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility".into(),
+        "-v".into(), format!("{}:/input", input_dir_docker),
+        "-v".into(), format!("{}:/tmp", tmp_dir_docker),
+        "--entrypoint".into(), "ffmpeg".into(),
+        "ladaapp/lada:latest".into(),
+        "-nostdin".into(), "-v".into(), "error".into(), "-y".into(),
+        "-i".into(), format!("/input/{}", input_file_name),
+        "-filter_complex".into(),
+        "[0:v]split=2[a][b];[a]crop=iw/2:ih:0:0[l];[b]crop=iw/2:ih:iw/2:0[r]".into(),
+        "-map".into(), "[l]".into(), "-c:v".into(), "hevc_nvenc".into(),
+        "-preset".into(), "p5".into(), "-cq".into(), "18".into(), "-an".into(), "/tmp/vr_left.mp4".into(),
+        "-map".into(), "[r]".into(), "-c:v".into(), "hevc_nvenc".into(),
+        "-preset".into(), "p5".into(), "-cq".into(), "18".into(), "-an".into(), "/tmp/vr_right.mp4".into(),
+    ];
+    let mut cmd = Command::new("docker");
+    cmd.args(&args);
+    hide_window(&mut cmd);
+    let out = cmd.output().await.map_err(|e| format!("split spawn failed: {}", e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).lines().rev().take(5)
+            .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | "))
+    }
+}
+
+/// Recombine the two processed halves (hstack) and mux the original audio
+/// back in, re-encoding video with the user's configured encoder.
+async fn docker_merge_lr(
+    input_dir_docker: &str,
+    tmp_dir_docker: &str,
+    output_dir_docker: &str,
+    orig_file_name: &str,
+    output_filename: &str,
+    settings: &LadaSettings,
+) -> Result<(), String> {
+    let encoder = &settings.encoder;
+    let mut venc: Vec<String> = vec!["-c:v".into(), encoder.clone()];
+    if encoder == "hevc_nvenc" || encoder == "h264_nvenc" {
+        venc.extend(["-preset".into(), settings.preset.clone(), "-cq".into(), settings.crf.to_string()]);
+    } else {
+        venc.extend(["-crf".into(), settings.crf.to_string(), "-preset".into(), settings.preset.clone(),
+            "-x265-params".into(), "log_level=error".into()]);
+    }
+
+    let mut args: Vec<String> = vec![
+        "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
+        "-e".into(), "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility".into(),
+        "-v".into(), format!("{}:/input", input_dir_docker),
+        "-v".into(), format!("{}:/tmp", tmp_dir_docker),
+        "-v".into(), format!("{}:/output", output_dir_docker),
+        "--entrypoint".into(), "ffmpeg".into(),
+        "ladaapp/lada:latest".into(),
+        "-nostdin".into(), "-v".into(), "error".into(), "-y".into(),
+        "-i".into(), "/tmp/vr_left_out.mp4".into(),
+        "-i".into(), "/tmp/vr_right_out.mp4".into(),
+        "-i".into(), format!("/input/{}", orig_file_name),
+        "-filter_complex".into(), "[0:v][1:v]hstack=inputs=2[v]".into(),
+        "-map".into(), "[v]".into(), "-map".into(), "2:a?".into(),
+    ];
+    args.extend(venc);
+    args.extend(["-c:a".into(), "copy".into(), format!("/output/{}", output_filename)]);
+
+    let mut cmd = Command::new("docker");
+    cmd.args(&args);
+    hide_window(&mut cmd);
+    let out = cmd.output().await.map_err(|e| format!("merge spawn failed: {}", e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).lines().rev().take(5)
+            .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | "))
+    }
+}
+
+/// Run one Lada job (with infinite retry-until-cancel), streaming progress
+/// mapped into [pct_base, pct_base + pct_span] of the overall file progress.
+/// `expected_output` is the host path that must exist (>1KB) to count as success.
+/// Returns true on success, false if cancelled.
+async fn run_lada_pass(
+    app: &tauri::AppHandle,
+    args: &[String],
+    expected_output: &std::path::Path,
+    index: usize,
+    total_files: usize,
+    file_name: &str,
+    label: &str,
+    pct_base: f64,
+    pct_span: f64,
+) -> bool {
+    let progress_re = Regex::new(r"Processing video:\s+(\d+)%").unwrap();
+    let remaining_re = Regex::new(r"Remaining:\s*(\S+)").unwrap();
+    let speed_re = Regex::new(r"Speed:\s*(\S+)").unwrap();
+
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        if CANCEL_FLAG.load(Ordering::SeqCst) { return false; }
+
+        let mut cmd = Command::new("docker");
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        cmd.args(&arg_refs);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        hide_window(&mut cmd);
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app.emit("progress", ProgressPayload {
+                    file_index: index, total_files,
+                    file_name: file_name.to_string(), progress: pct_base,
+                    status: "processing".to_string(),
+                    message: format!("{}Attempt {} failed to start: {}. Retrying in 30s...", label, attempt, e),
+                    remaining: String::new(), speed: String::new(),
+                });
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+
+        let stderr = child.stderr.take().unwrap();
+        let mut reader = BufReader::new(stderr);
+        let mut last_stderr_lines: Vec<String> = Vec::new();
+
+        let mut line_buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            match tokio::io::AsyncReadExt::read(&mut reader, &mut byte).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if byte[0] == b'\r' || byte[0] == b'\n' {
+                        if !line_buf.is_empty() {
+                            let line = String::from_utf8_lossy(&line_buf).to_string();
+                            line_buf.clear();
+
+                            if CANCEL_FLAG.load(Ordering::SeqCst) {
+                                let _ = child.kill().await;
+                                break;
+                            }
+
+                            last_stderr_lines.push(line.clone());
+                            if last_stderr_lines.len() > 10 { last_stderr_lines.remove(0); }
+
+                            if let Some(caps) = progress_re.captures(&line) {
+                                if let Ok(pct) = caps[1].parse::<f64>() {
+                                    let rem = remaining_re.captures(&line)
+                                        .map(|c| c[1].to_string()).unwrap_or_default();
+                                    let spd = speed_re.captures(&line)
+                                        .map(|c| c[1].to_string()).unwrap_or_default();
+                                    let detail = extract_progress_detail(&line);
+                                    let msg = if attempt > 1 {
+                                        format!("{}[Retry #{}] {}", label, attempt, detail)
+                                    } else {
+                                        format!("{}{}", label, detail)
+                                    };
+                                    let mapped = pct_base + pct * pct_span / 100.0;
+                                    let _ = app.emit("progress", ProgressPayload {
+                                        file_index: index, total_files,
+                                        file_name: file_name.to_string(),
+                                        progress: mapped, status: "processing".to_string(),
+                                        message: msg, remaining: rem, speed: spd,
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        line_buf.push(byte[0]);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let status = match child.wait().await {
+            Ok(s) => s,
+            Err(e) => {
+                write_log(&format!("RETRY file=\"{}\" {}attempt={} error: process wait failed: {}", file_name, label, attempt, e));
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+
+        if CANCEL_FLAG.load(Ordering::SeqCst) { return false; }
+
+        let output_valid = expected_output.exists()
+            && std::fs::metadata(expected_output).map(|m| m.len() > 1000).unwrap_or(false);
+
+        if status.success() && output_valid {
+            write_log(&format!("PASS-OK file=\"{}\" {}attempts={}", file_name, label, attempt));
+            return true;
+        } else {
+            let stderr_tail = last_stderr_lines.join("\n");
+            let error_msg = if status.success() && !output_valid {
+                format!("{}Attempt {}: output missing. Retrying in 30s...\n{}", label, attempt, stderr_tail)
+            } else {
+                format!("{}Attempt {}: exit code {:?}. Retrying in 30s...\n{}", label, attempt, status.code(), stderr_tail)
+            };
+            write_log(&format!("RETRY file=\"{}\" {}attempt={} error: {}", file_name, label, attempt, error_msg.replace('\n', " | ")));
+            let _ = app.emit("progress", ProgressPayload {
+                file_index: index, total_files,
+                file_name: file_name.to_string(), progress: pct_base,
+                status: "processing".to_string(), message: error_msg,
+                remaining: String::new(), speed: String::new(),
+            });
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let _ = std::fs::remove_file(expected_output);
+        }
+    }
+}
+
+/// VR (side-by-side) pipeline: split L/R → Lada each half → hstack + audio.
+#[allow(clippy::too_many_arguments)]
+async fn process_vr_file(
+    app: &tauri::AppHandle,
+    input_path: &std::path::Path,
+    input_dir_docker: &str,
+    output_dir: &std::path::Path,
+    output_dir_docker: &str,
+    tmp_dir: &std::path::Path,
+    tmp_dir_docker: &str,
+    input_file_name: &str,
+    output_filename: &str,
+    index: usize,
+    total_files: usize,
+    file_name: &str,
+    settings: &LadaSettings,
+) {
+    let left_in = tmp_dir.join("vr_left.mp4");
+    let right_in = tmp_dir.join("vr_right.mp4");
+    let left_out = tmp_dir.join("vr_left_out.mp4");
+    let right_out = tmp_dir.join("vr_right_out.mp4");
+    let cleanup = || {
+        for p in [&left_in, &right_in, &left_out, &right_out] { let _ = std::fs::remove_file(p); }
+    };
+    cleanup(); // clear any stale temp files from a prior run
+
+    // 1) Split into left/right halves
+    let _ = app.emit("progress", ProgressPayload {
+        file_index: index, total_files, file_name: file_name.to_string(), progress: 2.0,
+        status: "processing".to_string(), message: "VR detected — splitting L/R...".to_string(),
+        remaining: String::new(), speed: String::new(),
+    });
+    if let Err(e) = docker_split_lr(input_dir_docker, tmp_dir_docker, input_file_name).await {
+        write_log(&format!("VR-SPLIT-FAIL file=\"{}\" error: {}", file_name, e));
+        let _ = app.emit("progress", ProgressPayload {
+            file_index: index, total_files, file_name: file_name.to_string(), progress: 0.0,
+            status: "error".to_string(), message: format!("VR split failed: {}", e),
+            remaining: String::new(), speed: String::new(),
+        });
+        cleanup();
+        return;
+    }
+    if CANCEL_FLAG.load(Ordering::SeqCst) { cleanup(); return; }
+
+    // 2) Lada on each eye (tmp dir mounted as input/output/tmp)
+    let left_args = build_lada_args(tmp_dir_docker, tmp_dir_docker, tmp_dir_docker, "vr_left.mp4", "vr_left_out.mp4", settings);
+    if !run_lada_pass(app, &left_args, &left_out, index, total_files, file_name, "VR L: ", 5.0, 45.0).await {
+        cleanup(); return; // cancelled
+    }
+    let right_args = build_lada_args(tmp_dir_docker, tmp_dir_docker, tmp_dir_docker, "vr_right.mp4", "vr_right_out.mp4", settings);
+    if !run_lada_pass(app, &right_args, &right_out, index, total_files, file_name, "VR R: ", 50.0, 45.0).await {
+        cleanup(); return; // cancelled
+    }
+
+    // 3) Merge halves back + mux original audio
+    let _ = app.emit("progress", ProgressPayload {
+        file_index: index, total_files, file_name: file_name.to_string(), progress: 96.0,
+        status: "processing".to_string(), message: "VR: merging L/R + audio...".to_string(),
+        remaining: String::new(), speed: String::new(),
+    });
+    if let Err(e) = docker_merge_lr(input_dir_docker, tmp_dir_docker, output_dir_docker, input_file_name, output_filename, settings).await {
+        write_log(&format!("VR-MERGE-FAIL file=\"{}\" error: {}", file_name, e));
+        let _ = app.emit("progress", ProgressPayload {
+            file_index: index, total_files, file_name: file_name.to_string(), progress: 0.0,
+            status: "error".to_string(), message: format!("VR merge failed: {}", e),
+            remaining: String::new(), speed: String::new(),
+        });
+        cleanup();
+        return;
+    }
+
+    let output_file_path = output_dir.join(output_filename);
+    let output_valid = output_file_path.exists()
+        && std::fs::metadata(&output_file_path).map(|m| m.len() > 1000).unwrap_or(false);
+    cleanup(); // remove temp halves regardless
+
+    if !output_valid {
+        let _ = app.emit("progress", ProgressPayload {
+            file_index: index, total_files, file_name: file_name.to_string(), progress: 0.0,
+            status: "error".to_string(), message: "VR: merged output missing/invalid".to_string(),
+            remaining: String::new(), speed: String::new(),
+        });
+        return;
+    }
+
+    let final_msg = if settings.delete_original {
+        match std::fs::remove_file(input_path) {
+            Ok(_) => format!("Saved (VR): {} (original deleted)", output_filename),
+            Err(e) => format!("Saved (VR): {} (failed to delete original: {})", output_filename, e),
+        }
+    } else {
+        format!("Saved (VR): {}", output_filename)
+    };
+    let _ = app.emit("progress", ProgressPayload {
+        file_index: index, total_files, file_name: file_name.to_string(), progress: 100.0,
+        status: "done".to_string(), message: final_msg,
+        remaining: String::new(), speed: String::new(),
+    });
+    write_log(&format!("DONE(VR) file=\"{}\" output=\"{}\"", file_name, output_filename));
+}
+
 async fn process_single_file(
     app: tauri::AppHandle,
     file_path: String,
@@ -320,10 +773,6 @@ async fn process_single_file(
     total_files: usize,
     settings: LadaSettings,
 ) {
-    let progress_re = Regex::new(r"Processing video:\s+(\d+)%").unwrap();
-    let remaining_re = Regex::new(r"Remaining:\s*(\S+)").unwrap();
-    let speed_re = Regex::new(r"Speed:\s*(\S+)").unwrap();
-
     let input_path = PathBuf::from(&file_path);
     let file_name = file_name_from_path(&file_path);
 
@@ -356,179 +805,42 @@ async fn process_single_file(
         let _ = Command::new("chmod").args(["777", &tmp_dir_docker]).output().await;
     }
 
-    let encoder = &settings.encoder;
-    let encoder_options = if encoder == "hevc_nvenc" || encoder == "h264_nvenc" {
-        format!("-preset {} -cq {}", settings.preset, settings.crf)
-    } else {
-        format!("-crf {} -preset {} -x265-params log_level=error", settings.crf, settings.preset)
-    };
-
     let input_file_name = input_path.file_name().unwrap().to_string_lossy().to_string();
 
-    let mut args: Vec<String> = vec![
-        "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
-    ];
-    // Memory limit per container (prevents heap corruption / segfault)
-    if settings.memory_limit > 0 {
-        args.push("--memory".into());
-        args.push(format!("{}g", settings.memory_limit));
-    }
-    args.extend([
-        "-v".into(), format!("{}:/input", input_dir_docker),
-        "-v".into(), format!("{}:/output", output_dir_docker),
-        "-v".into(), format!("{}:/tmp", tmp_dir_docker),
-        "-e".into(), "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility".into(),
-        "ladaapp/lada:latest".into(),
-        "--input".into(), format!("/input/{}", input_file_name),
-        "--output".into(), format!("/output/{}", output_filename),
-        "--temporary-directory".into(), "/tmp".into(),
-        "--mosaic-detection-model".into(), settings.detection_model.clone(),
-        "--mosaic-restoration-model".into(), settings.restoration_model.clone(),
-        "--max-clip-length".into(), settings.max_clip_length.to_string(),
-        "--encoder".into(), encoder.clone(),
-        "--encoder-options".into(), encoder_options.clone(),
-    ]);
-    // FP16: "auto" lets Lada decide based on GPU capabilities; otherwise force on/off
-    match settings.fp16.as_str() {
-        "on" => args.push("--fp16".into()),
-        "off" => args.push("--no-fp16".into()),
-        _ => {}
+    // Auto-detect side-by-side VR (no user option). 2D files exit the gate after
+    // one cheap probe and take the unchanged normal path below.
+    if detect_sbs_vr(&input_dir_docker, &input_file_name).await {
+        process_vr_file(
+            &app, &input_path, &input_dir_docker, &output_dir, &output_dir_docker,
+            &tmp_dir, &tmp_dir_docker, &input_file_name, &output_filename,
+            index, total_files, &file_name, &settings,
+        ).await;
+        return;
     }
 
-    // Retry loop: on failure, log error and retry indefinitely until cancel
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
+    // ---- Normal 2D path ----
+    let args = build_lada_args(&input_dir_docker, &output_dir_docker, &tmp_dir_docker, &input_file_name, &output_filename, &settings);
+    let output_file_path = output_dir.join(&output_filename);
 
-        if CANCEL_FLAG.load(Ordering::SeqCst) { break; }
+    if !run_lada_pass(&app, &args, &output_file_path, index, total_files, &file_name, "", 0.0, 100.0).await {
+        return; // cancelled
+    }
 
-        let mut cmd = Command::new("docker");
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        cmd.args(&arg_refs);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        hide_window(&mut cmd);
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = app.emit("progress", ProgressPayload {
-                    file_index: index, total_files,
-                    file_name: file_name.clone(), progress: 0.0,
-                    status: "processing".to_string(),
-                    message: format!("Attempt {} failed to start: {}. Retrying in 30s...", attempt, e),
-                    remaining: String::new(), speed: String::new(),
-                });
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                continue;
-            }
-        };
-
-        let stderr = child.stderr.take().unwrap();
-        let mut reader = BufReader::new(stderr);
-        let mut last_stderr_lines: Vec<String> = Vec::new();
-
-        let app_clone = app.clone();
-        let file_name_clone = file_name.clone();
-        let progress_re_clone = progress_re.clone();
-
-        let mut line_buf = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            match tokio::io::AsyncReadExt::read(&mut reader, &mut byte).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    if byte[0] == b'\r' || byte[0] == b'\n' {
-                        if !line_buf.is_empty() {
-                            let line = String::from_utf8_lossy(&line_buf).to_string();
-                            line_buf.clear();
-
-                            if CANCEL_FLAG.load(Ordering::SeqCst) {
-                                let _ = child.kill().await;
-                                break;
-                            }
-
-                            last_stderr_lines.push(line.clone());
-                            if last_stderr_lines.len() > 10 { last_stderr_lines.remove(0); }
-
-                            if let Some(caps) = progress_re_clone.captures(&line) {
-                                if let Ok(pct) = caps[1].parse::<f64>() {
-                                    let rem = remaining_re.captures(&line)
-                                        .map(|c| c[1].to_string()).unwrap_or_default();
-                                    let spd = speed_re.captures(&line)
-                                        .map(|c| c[1].to_string()).unwrap_or_default();
-                                    let msg = if attempt > 1 {
-                                        format!("[Retry #{}] {}", attempt, extract_progress_detail(&line))
-                                    } else {
-                                        extract_progress_detail(&line)
-                                    };
-                                    let _ = app_clone.emit("progress", ProgressPayload {
-                                        file_index: index, total_files,
-                                        file_name: file_name_clone.clone(),
-                                        progress: pct, status: "processing".to_string(),
-                                        message: msg, remaining: rem, speed: spd,
-                                    });
-                                }
-                            }
-                        }
-                    } else {
-                        line_buf.push(byte[0]);
-                    }
-                }
-                Err(_) => break,
-            }
+    let final_msg = if settings.delete_original {
+        match std::fs::remove_file(&input_path) {
+            Ok(_) => format!("Saved: {} (original deleted)", output_filename),
+            Err(e) => format!("Saved: {} (failed to delete original: {})", output_filename, e),
         }
-
-        let status = match child.wait().await {
-            Ok(s) => s,
-            Err(e) => {
-                write_log(&format!("RETRY file=\"{}\" attempt={} error: process wait failed: {}", file_name, attempt, e));
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                continue;
-            }
-        };
-
-        if CANCEL_FLAG.load(Ordering::SeqCst) { break; }
-
-        let output_file_path = output_dir.join(&output_filename);
-        let output_valid = output_file_path.exists()
-            && std::fs::metadata(&output_file_path).map(|m| m.len() > 1000).unwrap_or(false);
-
-        if status.success() && output_valid {
-            let final_msg = if settings.delete_original {
-                match std::fs::remove_file(&input_path) {
-                    Ok(_) => format!("Saved: {} (original deleted)", output_filename),
-                    Err(e) => format!("Saved: {} (failed to delete original: {})", output_filename, e),
-                }
-            } else {
-                format!("Saved: {}", output_filename)
-            };
-            let _ = app.emit("progress", ProgressPayload {
-                file_index: index, total_files,
-                file_name: file_name.clone(), progress: 100.0,
-                status: "done".to_string(), message: final_msg,
-                remaining: String::new(), speed: String::new(),
-            });
-            write_log(&format!("DONE file=\"{}\" attempts={} output=\"{}\"", file_name, attempt, output_filename));
-            break;
-        } else {
-            let stderr_tail = last_stderr_lines.join("\n");
-            let error_msg = if status.success() && !output_valid {
-                format!("Attempt {}: output missing. Retrying in 30s...\n{}", attempt, stderr_tail)
-            } else {
-                format!("Attempt {}: exit code {:?}. Retrying in 30s...\n{}", attempt, status.code(), stderr_tail)
-            };
-            write_log(&format!("RETRY file=\"{}\" attempt={} error: {}", file_name, attempt, error_msg.replace('\n', " | ")));
-            let _ = app.emit("progress", ProgressPayload {
-                file_index: index, total_files,
-                file_name: file_name.clone(), progress: 0.0,
-                status: "processing".to_string(), message: error_msg,
-                remaining: String::new(), speed: String::new(),
-            });
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let _ = std::fs::remove_file(output_dir.join(&output_filename));
-        }
-    }
+    } else {
+        format!("Saved: {}", output_filename)
+    };
+    let _ = app.emit("progress", ProgressPayload {
+        file_index: index, total_files,
+        file_name: file_name.clone(), progress: 100.0,
+        status: "done".to_string(), message: final_msg,
+        remaining: String::new(), speed: String::new(),
+    });
+    write_log(&format!("DONE file=\"{}\" output=\"{}\"", file_name, output_filename));
 }
 
 #[tauri::command]
