@@ -428,38 +428,104 @@ async fn docker_lr_ssim(input_dir_docker: &str, input_file_name: &str, seek_sec:
 /// Auto-detect a left/right split (SBS) VR video. Two-stage gate keeps the
 /// common 2D case cheap: a non-2:1 aspect exits immediately after one probe;
 /// only ~2:1 candidates pay for the extra SSIM sample.
-async fn detect_sbs_vr(input_dir_docker: &str, input_file_name: &str) -> bool {
-    let (w, h, dur) = match docker_probe_dims(input_dir_docker, input_file_name).await {
-        Some(v) => v,
-        None => return false,
-    };
-    if h == 0 { return false; }
+/// Returns Some(duration_seconds) when the file is VR (SBS), None otherwise.
+async fn detect_sbs_vr(input_dir_docker: &str, input_file_name: &str) -> Option<f64> {
+    let (w, h, dur) = docker_probe_dims(input_dir_docker, input_file_name).await?;
+    if h == 0 { return None; }
     let ratio = w as f64 / h as f64;
     // 180° SBS is ~2:1 (two near-square eyes). Excludes 16:9 (1.78) and 2.39 scope.
-    if !(ratio > 1.9 && ratio < 2.1) { return false; }
+    if !(ratio > 1.9 && ratio < 2.1) { return None; }
     let seek = if dur > 20.0 { dur / 2.0 } else { 0.0 };
     match docker_lr_ssim(input_dir_docker, input_file_name, seek).await {
         Some(score) => {
             let is_vr = score >= 0.40;
             write_log(&format!("VR-DETECT file=\"{}\" {}x{} ratio={:.3} ssim={:.3} -> {}",
                 input_file_name, w, h, ratio, score, if is_vr { "VR(SBS)" } else { "2D" }));
-            is_vr
+            if is_vr { Some(dur) } else { None }
         }
-        None => false,
+        None => None,
     }
 }
 
-/// Split the input into /tmp/vr_left.mp4 and /tmp/vr_right.mp4 in a single
-/// decode pass (NVENC, high quality, no audio), via ffmpeg inside the image.
-async fn docker_split_lr(input_dir_docker: &str, tmp_dir_docker: &str, input_file_name: &str) -> Result<(), String> {
-    let args: Vec<String> = vec![
+/// Run an ffmpeg step (split/merge) inside the image, streaming ffmpeg's own
+/// `-progress` output (on stdout) into a mapped [pct_base, pct_base+pct_span]
+/// range so the UI shows real movement instead of appearing frozen.
+async fn run_ffmpeg_progress(
+    app: &tauri::AppHandle,
+    args: &[String],
+    duration_sec: f64,
+    index: usize,
+    total_files: usize,
+    file_name: &str,
+    label: &str,
+    pct_base: f64,
+    pct_span: f64,
+) -> Result<(), String> {
+    let mut cmd = Command::new("docker");
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    hide_window(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|e| format!("{}spawn failed: {}", label, e))?;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    // Drain stderr concurrently (holds any error text for diagnostics).
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut BufReader::new(stderr), &mut buf).await;
+        String::from_utf8_lossy(&buf).to_string()
+    });
+
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await.unwrap_or(0);
+        if n == 0 { break; }
+        if CANCEL_FLAG.load(Ordering::SeqCst) { let _ = child.kill().await; break; }
+        let l = line.trim();
+        if let Some(v) = l.strip_prefix("out_time_us=") {
+            if let Ok(us) = v.parse::<f64>() {
+                if duration_sec > 0.0 {
+                    let frac = (us / 1_000_000.0 / duration_sec).clamp(0.0, 1.0);
+                    let mapped = pct_base + frac * pct_span;
+                    let _ = app.emit("progress", ProgressPayload {
+                        file_index: index, total_files,
+                        file_name: file_name.to_string(), progress: mapped,
+                        status: "processing".to_string(),
+                        message: format!("{}{:.0}%", label, frac * 100.0),
+                        remaining: String::new(), speed: String::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| format!("{}wait failed: {}", label, e))?;
+    let err = stderr_task.await.unwrap_or_default();
+    if status.success() {
+        Ok(())
+    } else if CANCEL_FLAG.load(Ordering::SeqCst) {
+        Err("cancelled".to_string())
+    } else {
+        Err(err.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | "))
+    }
+}
+
+/// Build the ffmpeg args that split the input into /tmp/vr_left.mp4 and
+/// /tmp/vr_right.mp4 in a single decode pass (NVENC, high quality, no audio).
+/// `-progress pipe:1 -nostats` streams machine-readable progress on stdout.
+fn split_lr_args(input_dir_docker: &str, work_dir_docker: &str, input_file_name: &str) -> Vec<String> {
+    vec![
         "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
         "-e".into(), "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility".into(),
         "-v".into(), format!("{}:/input", input_dir_docker),
-        "-v".into(), format!("{}:/tmp", tmp_dir_docker),
+        "-v".into(), format!("{}:/tmp", work_dir_docker),
         "--entrypoint".into(), "ffmpeg".into(),
         "ladaapp/lada:latest".into(),
-        "-nostdin".into(), "-v".into(), "error".into(), "-y".into(),
+        "-nostdin".into(), "-v".into(), "error".into(), "-progress".into(), "pipe:1".into(), "-nostats".into(), "-y".into(),
         "-i".into(), format!("/input/{}", input_file_name),
         "-filter_complex".into(),
         "[0:v]split=2[a][b];[a]crop=iw/2:ih:0:0[l];[b]crop=iw/2:ih:iw/2:0[r]".into(),
@@ -467,29 +533,19 @@ async fn docker_split_lr(input_dir_docker: &str, tmp_dir_docker: &str, input_fil
         "-preset".into(), "p5".into(), "-cq".into(), "18".into(), "-an".into(), "/tmp/vr_left.mp4".into(),
         "-map".into(), "[r]".into(), "-c:v".into(), "hevc_nvenc".into(),
         "-preset".into(), "p5".into(), "-cq".into(), "18".into(), "-an".into(), "/tmp/vr_right.mp4".into(),
-    ];
-    let mut cmd = Command::new("docker");
-    cmd.args(&args);
-    hide_window(&mut cmd);
-    let out = cmd.output().await.map_err(|e| format!("split spawn failed: {}", e))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).lines().rev().take(5)
-            .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | "))
-    }
+    ]
 }
 
-/// Recombine the two processed halves (hstack) and mux the original audio
-/// back in, re-encoding video with the user's configured encoder.
-async fn docker_merge_lr(
+/// Build the ffmpeg args that recombine the two processed halves (hstack) and
+/// mux the original audio back in, re-encoding video with the user's encoder.
+fn merge_lr_args(
     input_dir_docker: &str,
-    tmp_dir_docker: &str,
+    work_dir_docker: &str,
     output_dir_docker: &str,
     orig_file_name: &str,
     output_filename: &str,
     settings: &LadaSettings,
-) -> Result<(), String> {
+) -> Vec<String> {
     let encoder = &settings.encoder;
     let mut venc: Vec<String> = vec!["-c:v".into(), encoder.clone()];
     if encoder == "hevc_nvenc" || encoder == "h264_nvenc" {
@@ -503,11 +559,11 @@ async fn docker_merge_lr(
         "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
         "-e".into(), "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility".into(),
         "-v".into(), format!("{}:/input", input_dir_docker),
-        "-v".into(), format!("{}:/tmp", tmp_dir_docker),
+        "-v".into(), format!("{}:/tmp", work_dir_docker),
         "-v".into(), format!("{}:/output", output_dir_docker),
         "--entrypoint".into(), "ffmpeg".into(),
         "ladaapp/lada:latest".into(),
-        "-nostdin".into(), "-v".into(), "error".into(), "-y".into(),
+        "-nostdin".into(), "-v".into(), "error".into(), "-progress".into(), "pipe:1".into(), "-nostats".into(), "-y".into(),
         "-i".into(), "/tmp/vr_left_out.mp4".into(),
         "-i".into(), "/tmp/vr_right_out.mp4".into(),
         "-i".into(), format!("/input/{}", orig_file_name),
@@ -516,17 +572,7 @@ async fn docker_merge_lr(
     ];
     args.extend(venc);
     args.extend(["-c:a".into(), "copy".into(), format!("/output/{}", output_filename)]);
-
-    let mut cmd = Command::new("docker");
-    cmd.args(&args);
-    hide_window(&mut cmd);
-    let out = cmd.output().await.map_err(|e| format!("merge spawn failed: {}", e))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).lines().rev().take(5)
-            .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | "))
-    }
+    args
 }
 
 /// Run one Lada job (with infinite retry-until-cancel), streaming progress
@@ -673,31 +719,37 @@ async fn process_vr_file(
     input_dir_docker: &str,
     output_dir: &std::path::Path,
     output_dir_docker: &str,
-    tmp_dir: &std::path::Path,
-    tmp_dir_docker: &str,
     input_file_name: &str,
     output_filename: &str,
     index: usize,
     total_files: usize,
     file_name: &str,
+    duration_sec: f64,
     settings: &LadaSettings,
 ) {
-    let left_in = tmp_dir.join("vr_left.mp4");
-    let right_in = tmp_dir.join("vr_right.mp4");
-    let left_out = tmp_dir.join("vr_left_out.mp4");
-    let right_out = tmp_dir.join("vr_right_out.mp4");
-    let cleanup = || {
-        for p in [&left_in, &right_in, &left_out, &right_out] { let _ = std::fs::remove_file(p); }
-    };
-    cleanup(); // clear any stale temp files from a prior run
+    // Keep the large intermediates on the OUTPUT drive (media disk), not the
+    // system temp dir — an 8K VR job's four halves can total tens of GB and
+    // would otherwise risk filling C:.
+    let work_dir = output_dir.join(format!(".lada_vr_tmp_{}", index));
+    let _ = std::fs::create_dir_all(&work_dir);
+    let work_dir_docker = to_docker_volume_path(work_dir.to_str().unwrap());
+    if !cfg!(windows) {
+        let _ = Command::new("chmod").args(["777", &work_dir_docker]).output().await;
+    }
 
-    // 1) Split into left/right halves
+    let left_out = work_dir.join("vr_left_out.mp4");
+    let right_out = work_dir.join("vr_right_out.mp4");
+    let cleanup = || { let _ = std::fs::remove_dir_all(&work_dir); };
+
+    // 1) Split into left/right halves (real progress mapped to 2–10%)
     let _ = app.emit("progress", ProgressPayload {
         file_index: index, total_files, file_name: file_name.to_string(), progress: 2.0,
         status: "processing".to_string(), message: "VR detected — splitting L/R...".to_string(),
         remaining: String::new(), speed: String::new(),
     });
-    if let Err(e) = docker_split_lr(input_dir_docker, tmp_dir_docker, input_file_name).await {
+    let split_args = split_lr_args(input_dir_docker, &work_dir_docker, input_file_name);
+    if let Err(e) = run_ffmpeg_progress(app, &split_args, duration_sec, index, total_files, file_name, "VR splitting L/R: ", 2.0, 8.0).await {
+        if CANCEL_FLAG.load(Ordering::SeqCst) { cleanup(); return; }
         write_log(&format!("VR-SPLIT-FAIL file=\"{}\" error: {}", file_name, e));
         let _ = app.emit("progress", ProgressPayload {
             file_index: index, total_files, file_name: file_name.to_string(), progress: 0.0,
@@ -709,23 +761,25 @@ async fn process_vr_file(
     }
     if CANCEL_FLAG.load(Ordering::SeqCst) { cleanup(); return; }
 
-    // 2) Lada on each eye (tmp dir mounted as input/output/tmp)
-    let left_args = build_lada_args(tmp_dir_docker, tmp_dir_docker, tmp_dir_docker, "vr_left.mp4", "vr_left_out.mp4", settings);
-    if !run_lada_pass(app, &left_args, &left_out, index, total_files, file_name, "VR L: ", 5.0, 45.0).await {
+    // 2) Lada on each eye (work dir mounted as input/output/tmp)
+    let left_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_left.mp4", "vr_left_out.mp4", settings);
+    if !run_lada_pass(app, &left_args, &left_out, index, total_files, file_name, "VR L: ", 10.0, 42.0).await {
         cleanup(); return; // cancelled
     }
-    let right_args = build_lada_args(tmp_dir_docker, tmp_dir_docker, tmp_dir_docker, "vr_right.mp4", "vr_right_out.mp4", settings);
-    if !run_lada_pass(app, &right_args, &right_out, index, total_files, file_name, "VR R: ", 50.0, 45.0).await {
+    let right_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_right.mp4", "vr_right_out.mp4", settings);
+    if !run_lada_pass(app, &right_args, &right_out, index, total_files, file_name, "VR R: ", 52.0, 42.0).await {
         cleanup(); return; // cancelled
     }
 
-    // 3) Merge halves back + mux original audio
+    // 3) Merge halves back + mux original audio (real progress mapped to 94–100%)
     let _ = app.emit("progress", ProgressPayload {
-        file_index: index, total_files, file_name: file_name.to_string(), progress: 96.0,
+        file_index: index, total_files, file_name: file_name.to_string(), progress: 94.0,
         status: "processing".to_string(), message: "VR: merging L/R + audio...".to_string(),
         remaining: String::new(), speed: String::new(),
     });
-    if let Err(e) = docker_merge_lr(input_dir_docker, tmp_dir_docker, output_dir_docker, input_file_name, output_filename, settings).await {
+    let merge_args = merge_lr_args(input_dir_docker, &work_dir_docker, output_dir_docker, input_file_name, output_filename, settings);
+    if let Err(e) = run_ffmpeg_progress(app, &merge_args, duration_sec, index, total_files, file_name, "VR merging: ", 94.0, 6.0).await {
+        if CANCEL_FLAG.load(Ordering::SeqCst) { cleanup(); return; }
         write_log(&format!("VR-MERGE-FAIL file=\"{}\" error: {}", file_name, e));
         let _ = app.emit("progress", ProgressPayload {
             file_index: index, total_files, file_name: file_name.to_string(), progress: 0.0,
@@ -809,11 +863,11 @@ async fn process_single_file(
 
     // Auto-detect side-by-side VR (no user option). 2D files exit the gate after
     // one cheap probe and take the unchanged normal path below.
-    if detect_sbs_vr(&input_dir_docker, &input_file_name).await {
+    if let Some(duration_sec) = detect_sbs_vr(&input_dir_docker, &input_file_name).await {
         process_vr_file(
             &app, &input_path, &input_dir_docker, &output_dir, &output_dir_docker,
-            &tmp_dir, &tmp_dir_docker, &input_file_name, &output_filename,
-            index, total_files, &file_name, &settings,
+            &input_file_name, &output_filename,
+            index, total_files, &file_name, duration_sec, &settings,
         ).await;
         return;
     }
