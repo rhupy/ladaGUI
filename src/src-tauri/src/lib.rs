@@ -37,6 +37,11 @@ use std::sync::Mutex;
 
 static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
 
+/// Max Lada clip window for VR (per-eye 4K) passes. The 2D default (up to 180)
+/// needs tens of GB at 4K and OOM-kills the container; 20 keeps RAM/VRAM
+/// bounded (~7 GB, verified) while retaining enough temporal context.
+const VR_MAX_CLIP_LENGTH: u32 = 20;
+
 static SYS_INFO: std::sync::LazyLock<Mutex<System>> = std::sync::LazyLock::new(|| {
     let mut sys = System::new_all();
     sys.refresh_cpu_all();
@@ -323,6 +328,8 @@ fn build_lada_args(
     input_file_name: &str,
     output_filename: &str,
     settings: &LadaSettings,
+    memory_limit_gb: u32,
+    clip_length: u32,
 ) -> Vec<String> {
     let encoder = &settings.encoder;
     let encoder_options = if encoder == "hevc_nvenc" || encoder == "h264_nvenc" {
@@ -334,10 +341,12 @@ fn build_lada_args(
     let mut args: Vec<String> = vec![
         "run".into(), "--rm".into(), "--gpus".into(), "all".into(),
     ];
-    // Memory limit per container (prevents heap corruption / segfault)
-    if settings.memory_limit > 0 {
+    // Memory limit per container (prevents heap corruption / segfault).
+    // VR passes pass 0 (unlimited): each split eye is 4K and OOMs at the
+    // normal 2D limit (exit 137 crash-loop), so they run uncapped.
+    if memory_limit_gb > 0 {
         args.push("--memory".into());
-        args.push(format!("{}g", settings.memory_limit));
+        args.push(format!("{}g", memory_limit_gb));
     }
     args.extend([
         "-v".into(), format!("{}:/input", input_dir_docker),
@@ -350,7 +359,7 @@ fn build_lada_args(
         "--temporary-directory".into(), "/tmp".into(),
         "--mosaic-detection-model".into(), settings.detection_model.clone(),
         "--mosaic-restoration-model".into(), settings.restoration_model.clone(),
-        "--max-clip-length".into(), settings.max_clip_length.to_string(),
+        "--max-clip-length".into(), clip_length.to_string(),
         "--encoder".into(), encoder.clone(),
         "--encoder-options".into(), encoder_options.clone(),
     ]);
@@ -762,11 +771,16 @@ async fn process_vr_file(
     if CANCEL_FLAG.load(Ordering::SeqCst) { cleanup(); return; }
 
     // 2) Lada on each eye (work dir mounted as input/output/tmp)
-    let left_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_left.mp4", "vr_left_out.mp4", settings);
+    // memory_limit=0 (unlimited) + a low clip length: each split eye is 4K, where the
+    // normal (up to 180-frame) clip window needs tens of GB and OOM-kills the container
+    // (exit 137 crash-loop). Capping the VR clip window keeps 4K RAM/VRAM bounded
+    // (~7 GB, verified) while VR's sequential passes make uncapped memory safe.
+    let vr_clip = settings.max_clip_length.min(VR_MAX_CLIP_LENGTH);
+    let left_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_left.mp4", "vr_left_out.mp4", settings, 0, vr_clip);
     if !run_lada_pass(app, &left_args, &left_out, index, total_files, file_name, "VR L: ", 10.0, 42.0).await {
         cleanup(); return; // cancelled
     }
-    let right_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_right.mp4", "vr_right_out.mp4", settings);
+    let right_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_right.mp4", "vr_right_out.mp4", settings, 0, vr_clip);
     if !run_lada_pass(app, &right_args, &right_out, index, total_files, file_name, "VR R: ", 52.0, 42.0).await {
         cleanup(); return; // cancelled
     }
@@ -873,7 +887,7 @@ async fn process_single_file(
     }
 
     // ---- Normal 2D path ----
-    let args = build_lada_args(&input_dir_docker, &output_dir_docker, &tmp_dir_docker, &input_file_name, &output_filename, &settings);
+    let args = build_lada_args(&input_dir_docker, &output_dir_docker, &tmp_dir_docker, &input_file_name, &output_filename, &settings, settings.memory_limit, settings.max_clip_length);
     let output_file_path = output_dir.join(&output_filename);
 
     if !run_lada_pass(&app, &args, &output_file_path, index, total_files, &file_name, "", 0.0, 100.0).await {

@@ -1,25 +1,26 @@
-## Lada GUI v0.5.1
+## Lada GUI v0.5.2
 
-v0.5.0의 VR 처리 UX·안정성 개선 릴리스입니다.
-UX and reliability fixes for the VR processing added in v0.5.0.
+VR 처리가 5%에서 멈춘 채 무한 반복되던 문제를 해결한 **중요 수정** 릴리스입니다.
+Important fix: VR jobs that got stuck looping at 5% now complete.
 
-### 🛠 개선 / Improvements
+### 🐞 버그 수정 / Bug fix
 
-- **VR 분리/합성 단계 진행률 표시 / Progress shown during VR split & merge**
-  - v0.5.0에서는 VR 영상의 좌우 분리·합성 중 진행률이 안 나와 **멈춘 것처럼 보였습니다.** 이제 이 단계에도 실시간 진행률이 표시됩니다.
-  - In v0.5.0 the split/merge stages showed no progress and **looked frozen.** These stages now report live progress.
-  - 카드 진행률 배분: 분리 2–10% → 좌안 복원 10–52% → 우안 복원 52–94% → 합성 94–100%.
-  - Progress mapping: split 2–10% → left eye 10–52% → right eye 52–94% → merge 94–100%.
-- **VR 중간 파일을 출력 드라이브에 저장 / VR temp files kept on the output drive**
-  - 8K VR은 중간 파일이 수십 GB에 달할 수 있어, 시스템 임시폴더(C:) 대신 **출력 폴더 옆**에 임시 작업 폴더를 만들어 처리 후 자동 삭제합니다. C: 용량 부족으로 인한 실패를 방지합니다.
-  - 8K VR intermediates can total tens of GB, so they are now written next to the output folder (not system temp / C:) and auto-deleted afterward, avoiding out-of-space failures.
+- **VR 복원 OOM 무한 재시도 해결 / Fixed VR restoration OOM crash-loop**
+  - v0.5.0/0.5.1에서 VR의 좌안 복원이 시작되자마자 컨테이너가 **메모리 부족(OOM)으로 강제 종료(exit 137)** 되고, 30초마다 재시도만 반복해 **5%에서 영원히 멈춰** 있었습니다.
+  - In v0.5.0/0.5.1 the left-eye restoration container was **killed for out-of-memory (exit 137)** the moment it started, and the app just retried every 30s — stuck at 5% forever.
+  - 원인: 분할된 각 눈이 **4K(4096×4096)** 라, 일반 2D용 설정(clip 길이 최대 180프레임 + 메모리 제한 10GB)으로는 메모리가 폭증해 죽었습니다.
+  - Cause: each split eye is **4K (4096×4096)**, so the normal 2D settings (clip length up to 180 + 10 GB memory cap) blew past memory and died.
+  - 수정: **VR 패스는 clip 길이를 20으로 낮추고 메모리 제한을 해제**합니다. 실측 결과 4K 복원이 약 7GB만 쓰고 정상 완료됩니다.
+  - Fix: **VR passes now use a clip length of 20 and run without the memory cap.** Measured: 4K restoration completes using only ~7 GB.
 
 ### ℹ️ 참고 / Notes
 
-- VR 처리는 8K 등 고해상도라 **분리 단계만 대략 영상 길이만큼(실시간) 걸린 뒤** 좌/우안 복원이 이어집니다. 전체적으로 시간이 꽤 걸릴 수 있습니다.
-- VR processing is high-resolution (8K); the **split stage alone takes roughly the video's own length (~realtime)** before the two eye-restoration passes begin, so the full job can take a while.
-- 일반 2D 영상은 영향 없음(2:1 아니면 즉시 기존 경로). VR 자동 감지·처리 방식은 v0.5.0과 동일합니다.
-- Normal 2D videos are unaffected. VR auto-detection/handling is unchanged from v0.5.0.
+- clip 길이를 20으로 낮춘 만큼 시간적 안정성이 약간 줄 수 있습니다(미세한 깜빡임 가능). 4K 메모리 한계상 불가피한 절충이며, 결과에 깜빡임이 보이면 알려주세요.
+- The lower clip length (20) slightly reduces temporal stability (possible faint flicker). It's a necessary trade-off for 4K memory limits — let me know if you see flicker.
+- v0.5.1의 개선(분리/합성 진행률 표시, 중간 파일을 출력 드라이브에 저장)도 포함됩니다.
+- Includes the v0.5.1 improvements (progress shown during split/merge, VR temp files on the output drive).
+- VR 자동 감지 방식은 v0.5.0과 동일하며, 일반 2D 영상은 영향 없습니다.
+- VR auto-detection is unchanged from v0.5.0; normal 2D videos are unaffected.
 
 ---
 
