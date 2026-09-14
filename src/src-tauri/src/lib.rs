@@ -750,7 +750,8 @@ fn available_space_for(path: &std::path::Path) -> Option<u64> {
 /// is both slower and riskier (an external HDD dropping mid-job kills the run).
 fn pick_vr_work_parent(input_path: &std::path::Path, output_dir: &std::path::Path) -> PathBuf {
     let input_size = std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0);
-    // Split halves + restored halves; measured ~4-5x the source for 8K SBS.
+    // Staged source + split halves + restored halves, with each half freed as
+    // soon as it is consumed; measured peak is ~4-5x the source for 8K SBS.
     let needed = input_size.saturating_mul(5);
     let sys_tmp = std::env::temp_dir();
     match available_space_for(&sys_tmp) {
@@ -767,15 +768,98 @@ fn pick_vr_work_parent(input_path: &std::path::Path, output_dir: &std::path::Pat
     }
 }
 
-/// VR (side-by-side) pipeline: split L/R → Lada each half → hstack + audio.
+/// Copy a file in chunks, reporting progress into [pct_base, pct_base+pct_span].
+/// Retries until it succeeds or the job is cancelled: the source or destination
+/// may live on a removable drive that briefly drops and reappears. This runs as
+/// ordinary host file I/O (never a Docker mount), which is exactly why it can
+/// recover — Docker Desktop keeps a broken mount for a dropped drive until it is
+/// restarted, whereas a plain Windows copy succeeds again the moment it returns.
+#[allow(clippy::too_many_arguments)]
+async fn copy_with_progress(
+    app: &tauri::AppHandle,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    index: usize,
+    total_files: usize,
+    file_name: &str,
+    label: &str,
+    pct_base: f64,
+    pct_span: f64,
+) -> Result<(), String> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        if CANCEL_FLAG.load(Ordering::SeqCst) { return Err("cancelled".into()); }
+
+        let app_c = app.clone();
+        let src_c = src.to_path_buf();
+        let dst_c = dst.to_path_buf();
+        let fname = file_name.to_string();
+        let lbl = label.to_string();
+
+        let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Read;
+            let mut fi = std::fs::File::open(&src_c)?;
+            let total = fi.metadata()?.len().max(1);
+            let mut fo = std::fs::File::create(&dst_c)?;
+            let mut buf = vec![0u8; 8 * 1024 * 1024];
+            let mut done: u64 = 0;
+            let mut last_emit: u64 = 0;
+            loop {
+                if CANCEL_FLAG.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+                }
+                let n = fi.read(&mut buf)?;
+                if n == 0 { break; }
+                fo.write_all(&buf[..n])?;
+                done += n as u64;
+                if done - last_emit >= 256 * 1024 * 1024 {
+                    last_emit = done;
+                    let frac = done as f64 / total as f64;
+                    let _ = app_c.emit("progress", ProgressPayload {
+                        file_index: index, total_files, file_name: fname.clone(),
+                        progress: pct_base + frac * pct_span,
+                        status: "processing".to_string(),
+                        message: format!("{}{:.0}%", lbl, frac * 100.0),
+                        remaining: String::new(), speed: String::new(),
+                    });
+                }
+            }
+            fo.flush()?;
+            Ok(())
+        }).await;
+
+        match res {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => {
+                if CANCEL_FLAG.load(Ordering::SeqCst) { return Err("cancelled".into()); }
+                let msg = format!("{}attempt {} failed: {} — retrying in 15s (is the drive connected?)", label, attempt, e);
+                write_log(&format!("VR-COPY-RETRY src=\"{}\" {}", src.display(), msg));
+                let _ = app.emit("progress", ProgressPayload {
+                    file_index: index, total_files, file_name: file_name.to_string(),
+                    progress: pct_base, status: "processing".to_string(), message: msg,
+                    remaining: String::new(), speed: String::new(),
+                });
+                let _ = std::fs::remove_file(dst); // drop the partial copy
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+            Err(e) => return Err(format!("{}copy task panicked: {}", label, e)),
+        }
+    }
+}
+
+/// VR (side-by-side) pipeline: stage the source onto the work drive → split L/R
+/// → Lada each half → hstack + audio → stage the result back out.
+///
+/// Everything Docker touches lives in `work_dir`. The source and output drives
+/// are only ever read/written by the two host-side copies, so a removable drive
+/// blinking out mid-job can no longer strand a multi-hour run behind a dead
+/// Docker mount — the copy simply retries once the drive is back.
 #[allow(clippy::too_many_arguments)]
 async fn process_vr_file(
     app: &tauri::AppHandle,
     input_path: &std::path::Path,
-    input_dir_docker: &str,
     output_dir: &std::path::Path,
-    output_dir_docker: &str,
-    input_file_name: &str,
     output_filename: &str,
     index: usize,
     total_files: usize,
@@ -783,8 +867,9 @@ async fn process_vr_file(
     duration_sec: f64,
     settings: &LadaSettings,
 ) {
-    // An 8K VR job's four halves total tens of GB, so place them on whichever
-    // drive can take it: fast system temp when it has room, else the output drive.
+    // An 8K VR job's staged source plus four halves total tens of GB, so place
+    // them on whichever drive can take it: fast system temp when it has room,
+    // else the output drive.
     let work_dir = pick_vr_work_parent(input_path, output_dir).join(format!("lada-vr-tmp-{}", index));
     let _ = std::fs::create_dir_all(&work_dir);
     let work_dir_docker = to_docker_volume_path(work_dir.to_str().unwrap());
@@ -792,68 +877,102 @@ async fn process_vr_file(
         let _ = Command::new("chmod").args(["777", &work_dir_docker]).output().await;
     }
 
+    // Stage under a plain ASCII name so the original's spaces/brackets/non-Latin
+    // characters never have to survive a round trip through docker arguments.
+    let ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+    let staged_name = format!("vr_source.{}", ext);
+    let staged_src = work_dir.join(&staged_name);
+    let left_in = work_dir.join("vr_left.mp4");
+    let right_in = work_dir.join("vr_right.mp4");
     let left_out = work_dir.join("vr_left_out.mp4");
     let right_out = work_dir.join("vr_right_out.mp4");
+    let merged = work_dir.join("vr_merged.mp4");
     let cleanup = || { let _ = std::fs::remove_dir_all(&work_dir); };
 
-    // 1) Split into left/right halves (real progress mapped to 2–10%)
-    let _ = app.emit("progress", ProgressPayload {
-        file_index: index, total_files, file_name: file_name.to_string(), progress: 2.0,
-        status: "processing".to_string(), message: "VR detected — splitting L/R...".to_string(),
-        remaining: String::new(), speed: String::new(),
-    });
-    let split_args = split_lr_args(input_dir_docker, &work_dir_docker, input_file_name);
-    if let Err(e) = run_ffmpeg_progress(app, &split_args, duration_sec, index, total_files, file_name, "VR splitting L/R: ", 2.0, 8.0).await {
-        if CANCEL_FLAG.load(Ordering::SeqCst) { cleanup(); return; }
-        write_log(&format!("VR-SPLIT-FAIL file=\"{}\" error: {}", file_name, e));
+    let fail = |stage: &str, e: String| {
+        write_log(&format!("VR-{}-FAIL file=\"{}\" error: {}", stage, file_name, e));
         let _ = app.emit("progress", ProgressPayload {
             file_index: index, total_files, file_name: file_name.to_string(), progress: 0.0,
-            status: "error".to_string(), message: format!("VR split failed: {}", e),
+            status: "error".to_string(), message: format!("VR {} failed: {}", stage.to_lowercase(), e),
             remaining: String::new(), speed: String::new(),
         });
+    };
+
+    // 1) Stage the source onto the work drive (0–5%)
+    let _ = app.emit("progress", ProgressPayload {
+        file_index: index, total_files, file_name: file_name.to_string(), progress: 0.0,
+        status: "processing".to_string(), message: "VR detected — copying source to work drive...".to_string(),
+        remaining: String::new(), speed: String::new(),
+    });
+    if let Err(e) = copy_with_progress(app, input_path, &staged_src, index, total_files, file_name, "VR copying in: ", 0.0, 5.0).await {
+        if !CANCEL_FLAG.load(Ordering::SeqCst) { fail("COPY-IN", e); }
+        cleanup();
+        return;
+    }
+
+    // 2) Split into left/right halves (5–12%)
+    let split_args = split_lr_args(&work_dir_docker, &work_dir_docker, &staged_name);
+    if let Err(e) = run_ffmpeg_progress(app, &split_args, duration_sec, index, total_files, file_name, "VR splitting L/R: ", 5.0, 7.0).await {
+        if !CANCEL_FLAG.load(Ordering::SeqCst) { fail("SPLIT", e); }
         cleanup();
         return;
     }
     if CANCEL_FLAG.load(Ordering::SeqCst) { cleanup(); return; }
 
-    // 2) Lada on each eye (work dir mounted as input/output/tmp)
+    // 3) Lada on each eye (work dir mounted as input/output/tmp).
     // memory_limit=0 (unlimited) + a low clip length: each split eye is 4K, where the
     // normal (up to 180-frame) clip window needs tens of GB and OOM-kills the container
     // (exit 137 crash-loop). Capping the VR clip window keeps 4K RAM/VRAM bounded
     // (~7 GB, verified) while VR's sequential passes make uncapped memory safe.
+    // Each half is deleted once restored, to bound peak disk use.
     let vr_clip = settings.max_clip_length.min(VR_MAX_CLIP_LENGTH);
     let left_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_left.mp4", "vr_left_out.mp4", settings, 0, vr_clip);
-    if !run_lada_pass(app, &left_args, &left_out, index, total_files, file_name, "VR L: ", 10.0, 42.0).await {
+    if !run_lada_pass(app, &left_args, &left_out, index, total_files, file_name, "VR L: ", 12.0, 40.0).await {
         cleanup(); return; // cancelled
     }
+    let _ = std::fs::remove_file(&left_in);
     let right_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_right.mp4", "vr_right_out.mp4", settings, 0, vr_clip);
-    if !run_lada_pass(app, &right_args, &right_out, index, total_files, file_name, "VR R: ", 52.0, 42.0).await {
+    if !run_lada_pass(app, &right_args, &right_out, index, total_files, file_name, "VR R: ", 52.0, 40.0).await {
         cleanup(); return; // cancelled
     }
+    let _ = std::fs::remove_file(&right_in);
 
-    // 3) Merge halves back + mux original audio (real progress mapped to 94–100%)
+    // 4) Merge halves back + mux the staged source's audio (92–97%)
     let _ = app.emit("progress", ProgressPayload {
-        file_index: index, total_files, file_name: file_name.to_string(), progress: 94.0,
+        file_index: index, total_files, file_name: file_name.to_string(), progress: 92.0,
         status: "processing".to_string(), message: "VR: merging L/R + audio...".to_string(),
         remaining: String::new(), speed: String::new(),
     });
-    let merge_args = merge_lr_args(input_dir_docker, &work_dir_docker, output_dir_docker, input_file_name, output_filename, settings);
-    if let Err(e) = run_ffmpeg_progress(app, &merge_args, duration_sec, index, total_files, file_name, "VR merging: ", 94.0, 6.0).await {
-        if CANCEL_FLAG.load(Ordering::SeqCst) { cleanup(); return; }
-        write_log(&format!("VR-MERGE-FAIL file=\"{}\" error: {}", file_name, e));
-        let _ = app.emit("progress", ProgressPayload {
-            file_index: index, total_files, file_name: file_name.to_string(), progress: 0.0,
-            status: "error".to_string(), message: format!("VR merge failed: {}", e),
-            remaining: String::new(), speed: String::new(),
-        });
+    let merge_args = merge_lr_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, &staged_name, "vr_merged.mp4", settings);
+    if let Err(e) = run_ffmpeg_progress(app, &merge_args, duration_sec, index, total_files, file_name, "VR merging: ", 92.0, 5.0).await {
+        if !CANCEL_FLAG.load(Ordering::SeqCst) { fail("MERGE", e); }
         cleanup();
         return;
     }
 
+    let merged_valid = merged.exists()
+        && std::fs::metadata(&merged).map(|m| m.len() > 1000).unwrap_or(false);
+    if !merged_valid {
+        fail("MERGE", "merged output missing/invalid".to_string());
+        cleanup();
+        return;
+    }
+    // Free the halves before writing the result back out.
+    let _ = std::fs::remove_file(&left_out);
+    let _ = std::fs::remove_file(&right_out);
+    let _ = std::fs::remove_file(&staged_src);
+
+    // 5) Stage the finished file back to the output drive (97–100%)
     let output_file_path = output_dir.join(output_filename);
+    if let Err(e) = copy_with_progress(app, &merged, &output_file_path, index, total_files, file_name, "VR copying out: ", 97.0, 3.0).await {
+        if !CANCEL_FLAG.load(Ordering::SeqCst) { fail("COPY-OUT", e); }
+        cleanup();
+        return;
+    }
+
     let output_valid = output_file_path.exists()
         && std::fs::metadata(&output_file_path).map(|m| m.len() > 1000).unwrap_or(false);
-    cleanup(); // remove temp halves regardless
+    cleanup(); // remove the work dir regardless
 
     if !output_valid {
         let _ = app.emit("progress", ProgressPayload {
@@ -925,8 +1044,7 @@ async fn process_single_file(
     // one cheap probe and take the unchanged normal path below.
     if let Some(duration_sec) = detect_sbs_vr(&input_dir_docker, &input_file_name).await {
         process_vr_file(
-            &app, &input_path, &input_dir_docker, &output_dir, &output_dir_docker,
-            &input_file_name, &output_filename,
+            &app, &input_path, &output_dir, &output_filename,
             index, total_files, &file_name, duration_sec, &settings,
         ).await;
         return;
