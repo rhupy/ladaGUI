@@ -702,10 +702,18 @@ async fn run_lada_pass(
             return true;
         } else {
             let stderr_tail = last_stderr_lines.join("\n");
+            // Docker exit 125 + a mount-source error almost always means the drive
+            // holding the video (or the work dir) went away — a disconnected
+            // external disk, or Docker Desktop losing that drive share.
+            let hint = if status.code() == Some(125) && stderr_tail.contains("mount source path") {
+                " [drive unavailable — check the drive is connected, then restart Docker Desktop]"
+            } else {
+                ""
+            };
             let error_msg = if status.success() && !output_valid {
                 format!("{}Attempt {}: output missing. Retrying in 30s...\n{}", label, attempt, stderr_tail)
             } else {
-                format!("{}Attempt {}: exit code {:?}. Retrying in 30s...\n{}", label, attempt, status.code(), stderr_tail)
+                format!("{}Attempt {}: exit code {:?}.{} Retrying in 30s...\n{}", label, attempt, status.code(), hint, stderr_tail)
             };
             write_log(&format!("RETRY file=\"{}\" {}attempt={} error: {}", file_name, label, attempt, error_msg.replace('\n', " | ")));
             let _ = app.emit("progress", ProgressPayload {
@@ -716,6 +724,45 @@ async fn run_lada_pass(
             });
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             let _ = std::fs::remove_file(expected_output);
+        }
+    }
+}
+
+/// Free bytes on the filesystem holding `path` (longest matching mount point).
+fn available_space_for(path: &std::path::Path) -> Option<u64> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut best: Option<(usize, u64)> = None;
+    for d in disks.list() {
+        let mp = d.mount_point();
+        if path.starts_with(mp) {
+            let len = mp.as_os_str().len();
+            if best.map_or(true, |(blen, _)| len > blen) {
+                best = Some((len, d.available_space()));
+            }
+        }
+    }
+    best.map(|(_, free)| free)
+}
+
+/// Pick where the big VR intermediates live. Prefer the system temp dir — it is
+/// normally a fast internal SSD — and fall back to the output drive only when
+/// system temp lacks room. Writing tens of GB to a slow/removable output drive
+/// is both slower and riskier (an external HDD dropping mid-job kills the run).
+fn pick_vr_work_parent(input_path: &std::path::Path, output_dir: &std::path::Path) -> PathBuf {
+    let input_size = std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0);
+    // Split halves + restored halves; measured ~4-5x the source for 8K SBS.
+    let needed = input_size.saturating_mul(5);
+    let sys_tmp = std::env::temp_dir();
+    match available_space_for(&sys_tmp) {
+        Some(free) if free > needed => {
+            write_log(&format!("VR-WORKDIR system temp (free={}GB needed={}GB)",
+                free / 1_000_000_000, needed / 1_000_000_000));
+            sys_tmp
+        }
+        other => {
+            write_log(&format!("VR-WORKDIR output drive (system temp free={:?} needed={}GB)",
+                other.map(|f| f / 1_000_000_000), needed / 1_000_000_000));
+            output_dir.to_path_buf()
         }
     }
 }
@@ -736,10 +783,9 @@ async fn process_vr_file(
     duration_sec: f64,
     settings: &LadaSettings,
 ) {
-    // Keep the large intermediates on the OUTPUT drive (media disk), not the
-    // system temp dir — an 8K VR job's four halves can total tens of GB and
-    // would otherwise risk filling C:.
-    let work_dir = output_dir.join(format!(".lada_vr_tmp_{}", index));
+    // An 8K VR job's four halves total tens of GB, so place them on whichever
+    // drive can take it: fast system temp when it has room, else the output drive.
+    let work_dir = pick_vr_work_parent(input_path, output_dir).join(format!("lada-vr-tmp-{}", index));
     let _ = std::fs::create_dir_all(&work_dir);
     let work_dir_docker = to_docker_volume_path(work_dir.to_str().unwrap());
     if !cfg!(windows) {

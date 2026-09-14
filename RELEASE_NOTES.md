@@ -1,24 +1,25 @@
-## Lada GUI v0.5.2
+## Lada GUI v0.5.3
 
-VR 처리가 5%에서 멈춘 채 무한 반복되던 문제를 해결한 **중요 수정** 릴리스입니다.
-Important fix: VR jobs that got stuck looping at 5% now complete.
+VR 중간 파일을 **빠르고 안전한 드라이브에 저장**하도록 개선한 릴리스입니다.
+VR intermediates are now placed on a fast, safe drive.
 
-### 🐞 버그 수정 / Bug fix
+### 🛠 개선 / Improvements
 
-- **VR 복원 OOM 무한 재시도 해결 / Fixed VR restoration OOM crash-loop**
-  - v0.5.0/0.5.1에서 VR의 좌안 복원이 시작되자마자 컨테이너가 **메모리 부족(OOM)으로 강제 종료(exit 137)** 되고, 30초마다 재시도만 반복해 **5%에서 영원히 멈춰** 있었습니다.
-  - In v0.5.0/0.5.1 the left-eye restoration container was **killed for out-of-memory (exit 137)** the moment it started, and the app just retried every 30s — stuck at 5% forever.
-  - 원인: 분할된 각 눈이 **4K(4096×4096)** 라, 일반 2D용 설정(clip 길이 최대 180프레임 + 메모리 제한 10GB)으로는 메모리가 폭증해 죽었습니다.
-  - Cause: each split eye is **4K (4096×4096)**, so the normal 2D settings (clip length up to 180 + 10 GB memory cap) blew past memory and died.
-  - 수정: **VR 패스는 clip 길이를 20으로 낮추고 메모리 제한을 해제**합니다. 실측 결과 4K 복원이 약 7GB만 쓰고 정상 완료됩니다.
-  - Fix: **VR passes now use a clip length of 20 and run without the memory cap.** Measured: 4K restoration completes using only ~7 GB.
+- **VR 임시 파일 위치 자동 선택 / Smarter VR temp-file location**
+  - v0.5.1/0.5.2는 VR 중간 파일(수십 GB)을 무조건 **출력 드라이브**에 썼습니다. 출력이 외장 HDD면 **느리고**, 장시간 대용량 쓰기 중 **연결이 끊기면 작업 전체가 실패**했습니다.
+  - v0.5.1/0.5.2 always wrote the VR intermediates (tens of GB) to the **output drive**. If that's an external HDD it is **slow**, and a disconnect during the long write **kills the whole job**.
+  - 이제 **시스템 임시 폴더(보통 내장 SSD)의 여유 공간을 먼저 확인해**, 충분하면 그쪽을 쓰고 부족할 때만 출력 드라이브로 넘어갑니다. (필요 공간은 원본 크기의 약 5배로 계산)
+  - Now it **checks free space on the system temp dir (usually a fast internal SSD)** and uses it when there's room, falling back to the output drive only if not. (Budget: ~5× the source file size.)
+- **드라이브 연결 끊김 오류 안내 / Clearer message when a drive disappears**
+  - Docker 마운트 실패(exit 125) 시 **"드라이브 연결 확인 후 Docker Desktop 재시작"** 안내가 함께 표시됩니다. 원인 모를 재시도 반복을 줄여줍니다.
+  - A Docker mount failure (exit 125) now shows a **"drive unavailable — check the drive, then restart Docker Desktop"** hint instead of silently retrying.
 
 ### ℹ️ 참고 / Notes
 
-- clip 길이를 20으로 낮춘 만큼 시간적 안정성이 약간 줄 수 있습니다(미세한 깜빡임 가능). 4K 메모리 한계상 불가피한 절충이며, 결과에 깜빡임이 보이면 알려주세요.
-- The lower clip length (20) slightly reduces temporal stability (possible faint flicker). It's a necessary trade-off for 4K memory limits — let me know if you see flicker.
-- v0.5.1의 개선(분리/합성 진행률 표시, 중간 파일을 출력 드라이브에 저장)도 포함됩니다.
-- Includes the v0.5.1 improvements (progress shown during split/merge, VR temp files on the output drive).
+- **VR 작업은 원본을 내장 SSD에 두고 돌리는 것을 권장합니다.** 8K VR은 몇 시간짜리 작업이라 외장 USB HDD는 도중에 끊길 위험이 큽니다.
+- **For VR jobs, keep the source on an internal SSD.** 8K VR runs for hours; external USB drives are prone to dropping mid-job.
+- v0.5.2의 OOM 수정(VR clip 길이 20 + 메모리 제한 해제)과 v0.5.1의 진행률 표시가 모두 포함됩니다.
+- Includes the v0.5.2 OOM fix (VR clip length 20 + no memory cap) and the v0.5.1 progress display.
 - VR 자동 감지 방식은 v0.5.0과 동일하며, 일반 2D 영상은 영향 없습니다.
 - VR auto-detection is unchanged from v0.5.0; normal 2D videos are unaffected.
 
