@@ -38,7 +38,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ3QjRGMjRFM0ExNkIxRDcKUldUWHNSWTZUdkswMTlDTGlxYmNpY1VvU1l0MHVyVzVQTm53QWQ3REgrSUlVbG1pYXNXZkNHWkwK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY2RUUwMzc2RjFGMzlBNzYKUldSMm12UHhkZ1B1OXB5TFRrcmNrR2xoelJNeGNvMTdYR0VzVzljdStESyttVytVRUVTVEJRaEkK",
       "endpoints": [
         "https://github.com/rhupy/ladaGUI/releases/latest/download/latest.json"
       ],
