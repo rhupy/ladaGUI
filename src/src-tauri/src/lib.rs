@@ -471,6 +471,10 @@ pub struct LadaSettings {
     shutdown_after: bool,
     parallel_jobs: u32,
     memory_limit: u32, // GB per container, 0 = unlimited
+    /// "auto" lets derive_settings own the tuned fields; "manual" leaves them
+    /// exactly as the user set them. Defaults to manual so an existing install
+    /// is never silently re-tuned; the frontend opts fresh installs into auto.
+    settings_mode: String,
 }
 
 /// Must stay in sync with the frontend's `$state` defaults in +page.svelte.
@@ -491,6 +495,7 @@ impl Default for LadaSettings {
             shutdown_after: false,
             parallel_jobs: 1,
             memory_limit: 10,
+            settings_mode: "manual".to_string(),
         }
     }
 }

@@ -57,10 +57,17 @@
   // Static machine specs, detected once and used to explain/derive settings.
   /** @type {any} */
   let hwProfile = $state(null);
+  /** @type {any} */
+  let derived = $state(null);
   let detecting = $state(false);
+  // "auto": derive_settings owns the tuned fields. "manual": the user does.
+  let settingsMode = $state("manual");
 
   let perfData = $state({ cpuUsage: 0, ramUsed: 0, ramTotal: 0, ramPercent: 0, gpuUsage: 0, vramUsage: 0, vramTotal: 0, gpuTemp: 0, gpuPower: 0 });
   let perfInterval = null;
+
+  // Rows that auto mode manages are locked while it is on.
+  const settingsLocked = $derived(processing || settingsMode === "auto");
 
   const VIDEO_EXTENSIONS = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts"];
 
@@ -97,6 +104,9 @@
     dockerRamCeiling: lang === "ko" ? "Docker 메모리 상한" : "Docker RAM Ceiling",
     tempFree: lang === "ko" ? "임시 폴더 여유" : "Temp Free",
     noGpuDetected: lang === "ko" ? "NVIDIA GPU를 찾지 못했습니다" : "No NVIDIA GPU detected",
+    settingsModeLabel: lang === "ko" ? "설정 방식" : "Settings Mode",
+    modeAuto: lang === "ko" ? "자동" : "Auto",
+    modeManual: lang === "ko" ? "수동" : "Manual",
     parallelJobsLabel: lang === "ko" ? "병렬 작업 수" : "Parallel Jobs",
     memoryLimitLabel: lang === "ko" ? "컨테이너 메모리" : "Memory Limit",
     encoderLabel: lang === "ko" ? "인코더" : "Encoder",
@@ -132,6 +142,9 @@
     maxClipLength: lang === "ko"
       ? "복원 단위 클립의 최대 프레임 수 (초 아님)\n클수록 시간적 안정성↑, VRAM 사용량↑\n180을 넘으면 속도 이득은 거의 없고 VRAM만 늘어남\n너무 작으면 오히려 느려짐\nVRAM 부족 시 낮추세요"
       : "Max frames per restoration clip (frames, not seconds)\nHigher = better temporal stability, more VRAM\nPast ~180 speed plateaus while VRAM keeps growing\nToo low is slower, not faster\nLower if running out of VRAM",
+    settingsMode: lang === "ko"
+      ? "자동: 감지된 사양에 맞춰 병렬 수·클립 길이·메모리·FP16·인코더를 계산해 적용합니다\n수동: 직접 지정한 값을 그대로 사용합니다\n\n자동이 관리하는 항목은 잠깁니다"
+      : "Auto: computes parallel jobs, clip length, memory, FP16 and encoder from the detected hardware\nManual: uses exactly what you set\n\nFields auto manages are locked",
     parallelJobs: lang === "ko"
       ? "동시 처리 영상 수. VRAM 사용량 × N\n\nRTX 3060 12GB: 1~2개\nRTX 3080/4070: 2~3개\nRTX 4080/4090: 3~6개\nRTX 5090: 4~8개"
       : "Number of concurrent videos. VRAM usage × N\n\nRTX 3060 12GB: 1-2\nRTX 3080/4070: 2-3\nRTX 4080/4090: 3-6\nRTX 5090: 4-8",
@@ -167,6 +180,7 @@
       delete_original: deleteOriginal,
       shutdown_after: shutdownAfter,
       parallel_jobs: parallelJobs,
+      settings_mode: settingsMode,
       memory_limit: memoryLimit,
     };
   }
@@ -202,7 +216,6 @@
   onMount(async () => {
     // App version → header + OS window title
     try {
-      detectHardware();
       appVersion = await getVersion();
       await getCurrentWindow().setTitle(`Lada GUI v${appVersion} - Mosaic Removal`);
     } catch (e) {
@@ -212,6 +225,11 @@
     // Load saved settings
     try {
       const saved = await invoke("load_settings");
+      if (!saved) {
+        // Fresh install: start in auto so the app tunes itself. An existing
+        // install keeps whatever the user already chose.
+        settingsMode = "auto";
+      }
       if (saved) {
         detectionModel = saved.detection_model ?? detectionModel;
         restorationModel = saved.restoration_model ?? restorationModel;
@@ -226,11 +244,16 @@
         deleteOriginal = saved.delete_original ?? deleteOriginal;
         shutdownAfter = saved.shutdown_after ?? shutdownAfter;
         parallelJobs = saved.parallel_jobs ?? parallelJobs;
+        settingsMode = saved.settings_mode ?? settingsMode;
         memoryLimit = saved.memory_limit ?? memoryLimit;
       }
     } catch (e) {
       console.log("No saved settings found");
     }
+
+    // Only now is settingsMode known, so a derived recommendation can be
+    // applied (or not) according to the mode the user actually has.
+    detectHardware();
 
     // Load saved language
     const savedLang = localStorage.getItem("lada-gui-lang");
@@ -470,12 +493,37 @@
     detecting = true;
     try {
       hwProfile = await invoke("detect_hardware", { force });
+      await refreshDerived();
     } catch (e) {
       console.error("Hardware detection failed:", e);
       addLogEntry(`Hardware detection failed: ${e}`, "error");
     } finally {
       detecting = false;
     }
+  }
+
+  async function refreshDerived() {
+    try {
+      derived = await invoke("recommend_settings");
+    } catch (e) {
+      // Hardware not detected yet, or no GPU — leave the panel showing nothing.
+      derived = null;
+      return;
+    }
+    if (settingsMode !== "auto" || !derived) return;
+    parallelJobs = derived.parallel_jobs;
+    maxClipLength = derived.max_clip_length;
+    memoryLimit = derived.memory_limit;
+    fp16 = derived.fp16;
+    encoder = derived.encoder;
+    persistSettings();
+  }
+
+  /** @param {string} mode */
+  function setSettingsMode(mode) {
+    settingsMode = mode;
+    persistSettings();
+    if (mode === "auto") refreshDerived();
   }
 
   async function fetchPerfData() {
@@ -627,6 +675,26 @@
           <div class="perf-row"><span class="hw-value">{detecting ? t.detecting : "—"}</span></div>
         {/if}
       </div>
+
+      <div class="setting-row">
+        <label>{t.settingsModeLabel}</label>
+        <div class="mode-toggle">
+          <button class:active={settingsMode === "auto"} onclick={() => setSettingsMode("auto")} disabled={processing}>{t.modeAuto}</button>
+          <button class:active={settingsMode === "manual"} onclick={() => setSettingsMode("manual")} disabled={processing}>{t.modeManual}</button>
+        </div>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.settingsMode}</span></span>
+      </div>
+
+      {#if settingsMode === "auto" && derived}
+        <div class="derived-block">
+          {#each derived.rationale as line}
+            <div class="derived-line">· {line}</div>
+          {/each}
+          {#each derived.warnings as line}
+            <div class="derived-line derived-warn">! {line}</div>
+          {/each}
+        </div>
+      {/if}
       <div class="setting-row">
         <label>{t.detectionModel}</label>
         <select bind:value={detectionModel} disabled={processing} onchange={persistSettings}>
@@ -646,7 +714,7 @@
       </div>
       <div class="setting-row">
         <label>{t.fp16Label}</label>
-        <select bind:value={fp16} disabled={processing} onchange={persistSettings}>
+        <select bind:value={fp16} disabled={settingsLocked} onchange={persistSettings}>
           <option value="auto">{t.fp16Auto}</option>
           <option value="on">{t.fp16On}</option>
           <option value="off">{t.fp16Off}</option>
@@ -655,19 +723,19 @@
       </div>
       <div class="setting-row">
         <label>{t.maxClipLength}</label>
-        <input type="number" bind:value={maxClipLength} min="30" max="600" disabled={processing} onchange={persistSettings} />
+        <input type="number" bind:value={maxClipLength} min="30" max="600" disabled={settingsLocked} onchange={persistSettings} />
         <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.maxClipLength}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.parallelJobsLabel}</label>
         <div class="number-spinner">
-          <button class="spin-btn" onclick={() => { if (parallelJobs > 1) { parallelJobs--; persistSettings(); } }} disabled={processing}>-</button>
+          <button class="spin-btn" onclick={() => { if (parallelJobs > 1) { parallelJobs--; persistSettings(); } }} disabled={settingsLocked}>-</button>
           <input
             type="number"
             bind:value={parallelJobs}
             min="1"
             max="99"
-            disabled={processing}
+            disabled={settingsLocked}
             onchange={(e) => {
               let v = parseInt(e.target.value) || 1;
               if (v < 1) v = 1;
@@ -676,20 +744,20 @@
               persistSettings();
             }}
           />
-          <button class="spin-btn" onclick={() => { if (parallelJobs < 99) { parallelJobs++; persistSettings(); } }} disabled={processing}>+</button>
+          <button class="spin-btn" onclick={() => { if (parallelJobs < 99) { parallelJobs++; persistSettings(); } }} disabled={settingsLocked}>+</button>
         </div>
         <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.parallelJobs}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.memoryLimitLabel}</label>
         <div class="number-spinner">
-          <button class="spin-btn" onclick={() => { if (memoryLimit > 0) { memoryLimit--; persistSettings(); } }} disabled={processing}>-</button>
+          <button class="spin-btn" onclick={() => { if (memoryLimit > 0) { memoryLimit--; persistSettings(); } }} disabled={settingsLocked}>-</button>
           <input
             type="number"
             bind:value={memoryLimit}
             min="0"
             max="128"
-            disabled={processing}
+            disabled={settingsLocked}
             onchange={(e) => {
               let v = parseInt(e.target.value) || 0;
               if (v < 0) v = 0;
@@ -698,14 +766,14 @@
               persistSettings();
             }}
           />
-          <button class="spin-btn" onclick={() => { if (memoryLimit < 128) { memoryLimit++; persistSettings(); } }} disabled={processing}>+</button>
+          <button class="spin-btn" onclick={() => { if (memoryLimit < 128) { memoryLimit++; persistSettings(); } }} disabled={settingsLocked}>+</button>
         </div>
         <span class="mem-unit">GB</span>
         <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.memoryLimit}</span></span>
       </div>
       <div class="setting-row">
         <label>{t.encoderLabel}</label>
-        <select bind:value={encoder} disabled={processing} onchange={persistSettings}>
+        <select bind:value={encoder} disabled={settingsLocked} onchange={persistSettings}>
           <option value="hevc_nvenc">hevc_nvenc (GPU)</option>
           <option value="h264_nvenc">h264_nvenc (GPU)</option>
           <option value="libx265">libx265 (CPU)</option>
@@ -1312,6 +1380,37 @@
     white-space: nowrap;
   }
   .hw-warn { color: #f4978e; }
+
+  .mode-toggle { display: flex; gap: 4px; }
+  .mode-toggle button {
+    background: #2a2a2a;
+    color: #999;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 3px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .mode-toggle button.active {
+    background: #3a4a5a;
+    color: #fff;
+    border-color: #4a6a8a;
+  }
+  .mode-toggle button:disabled { opacity: 0.5; cursor: default; }
+
+  .derived-block {
+    margin: 2px 0 8px 0;
+    padding: 6px 8px;
+    background: #1e1e1e;
+    border-left: 2px solid #4a6a8a;
+    border-radius: 3px;
+  }
+  .derived-line {
+    font-size: 11px;
+    color: #999;
+    line-height: 1.5;
+  }
+  .derived-warn { color: #f4978e; }
 
   .perf-row {
     display: flex;
