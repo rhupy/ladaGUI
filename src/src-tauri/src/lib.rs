@@ -236,6 +236,148 @@ fn version_major(v: &str) -> u32 {
     v.split('.').next().and_then(|x| x.parse().ok()).unwrap_or(0)
 }
 
+/// Measured Lada VRAM cost at 1080p: (max_clip_length, MB above idle).
+/// From E4 on an RTX 5090 over a 90s 2700-frame sample. Time was flat across
+/// this whole range, so a larger clip buys temporal stability, not speed.
+const LADA_VRAM_MB_1080P: &[(u32, u64)] = &[(45, 1982), (90, 2352), (180, 3149), (300, 3935)];
+
+/// Interpolate the table above; clamps outside its measured range rather than
+/// extrapolating into numbers nobody measured.
+fn lada_vram_mb_for_clip(clip: u32) -> u64 {
+    let first = LADA_VRAM_MB_1080P[0];
+    let last = LADA_VRAM_MB_1080P[LADA_VRAM_MB_1080P.len() - 1];
+    if clip <= first.0 { return first.1; }
+    if clip >= last.0 { return last.1; }
+    for w in LADA_VRAM_MB_1080P.windows(2) {
+        let (c0, v0) = w[0];
+        let (c1, v1) = w[1];
+        if clip >= c0 && clip <= c1 {
+            let t = (clip - c0) as f64 / (c1 - c0) as f64;
+            return v0 + ((v1 - v0) as f64 * t) as u64;
+        }
+    }
+    last.1
+}
+
+/// Settings recommended for a machine, with the reasoning shown to the user.
+#[derive(Clone, Serialize, Default)]
+pub struct DerivedSettings {
+    parallel_jobs: u32,
+    max_clip_length: u32,
+    memory_limit: u32,
+    fp16: String,
+    encoder: String,
+    /// One line per decision, rendered in the settings panel.
+    rationale: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// Pure, testable: no I/O, no globals. Aims for "use the machine well without
+/// ever putting a job at risk", which in practice means fitting inside the
+/// smallest of the VRAM, Docker-RAM and CPU ceilings.
+pub fn derive_settings(hw: &HardwareProfile) -> DerivedSettings {
+    let mut rationale = Vec::new();
+    let mut warnings = Vec::new();
+
+    if hw.vram_total_mb == 0 {
+        warnings.push("No NVIDIA GPU detected — falling back to conservative CPU settings.".into());
+        return DerivedSettings {
+            parallel_jobs: 1,
+            max_clip_length: 90,
+            memory_limit: 8,
+            fp16: "off".into(),
+            encoder: "libx265".into(),
+            rationale,
+            warnings,
+        };
+    }
+
+    // Clip: the Lada CLI default. E4 measured no speed gain from going higher,
+    // only more VRAM, so there is nothing to win by pushing past it.
+    let clip = 180u32;
+    let vram_per_job = lada_vram_mb_for_clip(clip);
+
+    // Leave the driver and desktop compositor room; never plan against the last
+    // megabyte of VRAM.
+    let usable_vram = ((hw.vram_total_mb as f64 * 0.85) as u64).saturating_sub(1024);
+    let by_vram = (usable_vram / vram_per_job).max(1) as u32;
+
+    // Container limits must fit inside Docker's VM, not inside host RAM.
+    let ram_ceiling_mb = if hw.docker_ram_limit_mb > 0 {
+        hw.docker_ram_limit_mb.min(hw.ram_total_mb)
+    } else {
+        warnings.push("Could not read Docker's memory ceiling; assuming half of host RAM.".into());
+        hw.ram_total_mb / 2
+    };
+    let usable_ram_mb = (ram_ceiling_mb as f64 * 0.80) as u64;
+
+    // Lada decodes on the CPU, which is what actually saturates first on a big
+    // GPU; roughly four cores per concurrent job.
+    let by_cpu = (hw.cpu_physical_cores / 4).max(1);
+
+    // Give every job at least this much RAM, so parallelism is bounded by what
+    // can actually be handed out rather than by an arbitrary job count.
+    const MIN_RAM_PER_JOB_MB: u64 = 8 * 1024;
+    let by_ram = (usable_ram_mb / MIN_RAM_PER_JOB_MB).max(1) as u32;
+
+    let parallel_jobs = by_vram.min(by_cpu).min(by_ram).clamp(1, 8);
+
+    let binding = if parallel_jobs == by_vram { "VRAM" }
+        else if parallel_jobs == by_cpu { "CPU cores" }
+        else { "Docker memory" };
+    rationale.push(format!(
+        "{} concurrent jobs — limited by {} (VRAM allows {}, CPU {}, Docker RAM {}).",
+        parallel_jobs, binding, by_vram, by_cpu, by_ram
+    ));
+    rationale.push(format!(
+        "Clip length {} frames — measured to cost ~{} MB VRAM per job, and larger clips cost more VRAM without running faster.",
+        clip, vram_per_job
+    ));
+
+    let memory_limit = ((usable_ram_mb / parallel_jobs as u64) / 1024).clamp(8, 24) as u32;
+    rationale.push(format!(
+        "{} GB per container — an equal share of the {} GB Docker can actually provide.",
+        memory_limit, ram_ceiling_mb / 1024
+    ));
+
+    // Volta and newer have real fp16 throughput; below that it can be slower.
+    let fp16 = if hw.compute_cap_major >= 7 { "on" } else { "auto" };
+    rationale.push(format!("FP16 {} — compute capability {}.", fp16, hw.compute_cap));
+
+    let encoder = if hw.nvenc_present { "hevc_nvenc" } else { "libx265" };
+    rationale.push(format!("Encoder {} — {}.", encoder,
+        if hw.nvenc_present { "NVENC available" } else { "no NVIDIA encoder, using CPU" }));
+
+    if hw.temp_free_gb < 100 {
+        warnings.push(format!(
+            "Only {} GB free on the temp drive. VR jobs stage several times the source size there.",
+            hw.temp_free_gb
+        ));
+    }
+    if !hw.docker_ok {
+        warnings.push("Docker is not running — the Lada engine cannot start.".into());
+    }
+
+    DerivedSettings {
+        parallel_jobs,
+        max_clip_length: clip,
+        memory_limit,
+        fp16: fp16.to_string(),
+        encoder: encoder.to_string(),
+        rationale,
+        warnings,
+    }
+}
+
+#[tauri::command]
+async fn recommend_settings() -> Result<DerivedSettings, String> {
+    let hw = HW_CACHE.lock().unwrap().clone();
+    match hw {
+        Some(hw) => Ok(derive_settings(&hw)),
+        None => Err("hardware not detected yet".to_string()),
+    }
+}
+
 #[tauri::command]
 async fn detect_hardware(force: bool) -> Result<HardwareProfile, String> {
     if !force {
@@ -1498,6 +1640,7 @@ pub fn run() {
             load_settings,
             get_system_stats,
             detect_hardware,
+            recommend_settings,
             shutdown_pc,
         ])
         .setup(|app| {
@@ -1663,6 +1806,87 @@ mod tests {
     fn lada_grammar_ignores_unrelated_output() {
         assert!(LADA_GRAMMAR.pct.captures("Loading model weights...").is_none());
         assert!(LADA_GRAMMAR.pct.captures("").is_none());
+    }
+
+    fn hw(vram_mb: u64, cores: u32, ram_gb: u64, docker_gb: u64, cc_major: u32) -> HardwareProfile {
+        HardwareProfile {
+            gpu_name: if vram_mb > 0 { "TEST GPU".into() } else { String::new() },
+            gpu_count: if vram_mb > 0 { 1 } else { 0 },
+            vram_total_mb: vram_mb,
+            compute_cap_major: cc_major,
+            compute_cap: format!("{}.0", cc_major),
+            nvenc_present: vram_mb > 0,
+            cpu_physical_cores: cores,
+            cpu_logical_cores: cores * 2,
+            ram_total_mb: ram_gb * 1024,
+            docker_ram_limit_mb: docker_gb * 1024,
+            docker_ok: true,
+            temp_free_gb: 500,
+            ..Default::default()
+        }
+    }
+
+    /// The invariants that matter are "never plan beyond what exists", not any
+    /// particular recommended number.
+    #[test]
+    fn derived_settings_always_fit_the_machine() {
+        let machines = [
+            ("5090", hw(32607, 16, 47, 47, 12)),
+            ("4090", hw(24564, 16, 64, 32, 8)),
+            ("3060", hw(12288, 8, 32, 16, 8)),
+            ("1060", hw(6144, 4, 16, 8, 6)),
+            ("docker ceiling well below host RAM", hw(24564, 32, 128, 8, 8)),
+            ("many cores, little VRAM", hw(6144, 32, 128, 64, 8)),
+            ("few cores, much VRAM", hw(32607, 4, 64, 64, 12)),
+        ];
+        for (name, p) in machines {
+            let d = derive_settings(&p);
+            assert!((1..=8).contains(&d.parallel_jobs), "{name}: jobs out of range");
+
+            let vram_per_job = lada_vram_mb_for_clip(d.max_clip_length);
+            let planned_vram = vram_per_job * d.parallel_jobs as u64;
+            assert!(planned_vram <= p.vram_total_mb,
+                "{name}: plans {planned_vram}MB VRAM of {}MB", p.vram_total_mb);
+
+            let planned_ram_mb = d.memory_limit as u64 * 1024 * d.parallel_jobs as u64;
+            assert!(planned_ram_mb <= p.docker_ram_limit_mb,
+                "{name}: plans {planned_ram_mb}MB RAM inside a {}MB Docker VM", p.docker_ram_limit_mb);
+
+            assert!(!d.rationale.is_empty(), "{name}: must explain itself");
+        }
+    }
+
+    #[test]
+    fn a_machine_without_a_gpu_still_gets_usable_settings() {
+        let d = derive_settings(&hw(0, 8, 16, 8, 0));
+        assert_eq!(d.parallel_jobs, 1);
+        assert_eq!(d.encoder, "libx265");
+        assert!(d.warnings.iter().any(|w| w.contains("No NVIDIA GPU")));
+    }
+
+    #[test]
+    fn a_small_docker_ceiling_limits_concurrency_not_just_memory() {
+        // 8GB of Docker RAM cannot host several jobs at the 8GB floor.
+        let d = derive_settings(&hw(32607, 32, 128, 8, 12));
+        assert_eq!(d.parallel_jobs, 1, "must not plan more jobs than Docker RAM allows");
+    }
+
+    #[test]
+    fn low_temp_space_is_warned_about() {
+        let mut p = hw(32607, 16, 47, 47, 12);
+        p.temp_free_gb = 20;
+        let d = derive_settings(&p);
+        assert!(d.warnings.iter().any(|w| w.contains("temp drive")));
+    }
+
+    #[test]
+    fn vram_table_interpolates_and_clamps() {
+        assert_eq!(lada_vram_mb_for_clip(45), 1982);
+        assert_eq!(lada_vram_mb_for_clip(300), 3935);
+        assert_eq!(lada_vram_mb_for_clip(10), 1982, "below the measured range clamps");
+        assert_eq!(lada_vram_mb_for_clip(999), 3935, "above the measured range clamps");
+        let mid = lada_vram_mb_for_clip(135);
+        assert!(mid > 2352 && mid < 3149, "135 sits between the 90 and 180 samples, got {mid}");
     }
 
     #[test]
