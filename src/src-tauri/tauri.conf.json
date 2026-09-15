@@ -33,6 +33,18 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ3QjRGMjRFM0ExNkIxRDcKUldUWHNSWTZUdkswMTlDTGlxYmNpY1VvU1l0MHVyVzVQTm53QWQ3REgrSUlVbG1pYXNXZkNHWkwK",
+      "endpoints": [
+        "https://github.com/rhupy/ladaGUI/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

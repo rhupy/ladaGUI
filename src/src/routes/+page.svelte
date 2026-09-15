@@ -5,9 +5,15 @@
   import { open as shellOpen } from "@tauri-apps/plugin-shell";
   import { getVersion } from "@tauri-apps/api/app";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { check as checkAppUpdate } from "@tauri-apps/plugin-updater";
+  import { relaunch } from "@tauri-apps/plugin-process";
   import { onMount } from "svelte";
 
   let appVersion = $state("");
+  /** @type {any} */
+  let updateInfo = $state(null);
+  let appUpdating = $state(false);
+  let updateProgress = $state(0);
 
   let files = $state([]);
   let dockerStatus = $state("Checking...");
@@ -107,6 +113,11 @@
     settingsModeLabel: lang === "ko" ? "설정 방식" : "Settings Mode",
     modeAuto: lang === "ko" ? "자동" : "Auto",
     modeManual: lang === "ko" ? "수동" : "Manual",
+    updateAvailable: lang === "ko" ? "새 버전이 있습니다" : "Update available",
+    updateNow: lang === "ko" ? "지금 업데이트" : "Update now",
+    updateDownloading: lang === "ko" ? "내려받는 중" : "Downloading",
+    updateBusy: lang === "ko" ? "작업이 끝난 뒤 업데이트할 수 있습니다" : "Finish the current jobs before updating",
+    updateLater: lang === "ko" ? "나중에" : "Later",
     parallelJobsLabel: lang === "ko" ? "병렬 작업 수" : "Parallel Jobs",
     memoryLimitLabel: lang === "ko" ? "컨테이너 메모리" : "Memory Limit",
     encoderLabel: lang === "ko" ? "인코더" : "Encoder",
@@ -254,6 +265,7 @@
     // Only now is settingsMode known, so a derived recommendation can be
     // applied (or not) according to the mode the user actually has.
     detectHardware();
+    checkForAppUpdate();
 
     // Load saved language
     const savedLang = localStorage.getItem("lada-gui-lang");
@@ -502,6 +514,43 @@
     }
   }
 
+  async function checkForAppUpdate() {
+    try {
+      const u = await checkAppUpdate();
+      if (u) {
+        updateInfo = u;
+        addLogEntry(`Update available: v${u.version}`, "info");
+      }
+    } catch (e) {
+      // Offline, or no release published yet — not worth bothering the user.
+      console.log("Update check skipped:", e);
+    }
+  }
+
+  async function installAppUpdate() {
+    // Windows exits the app during the install step, so an update must never
+    // run while jobs are in flight.
+    if (!updateInfo || processing || appUpdating) return;
+    appUpdating = true;
+    updateProgress = 0;
+    try {
+      let total = 0;
+      let received = 0;
+      await updateInfo.downloadAndInstall(/** @param {any} ev */ (ev) => {
+        if (ev.event === "Started") {
+          total = ev.data?.contentLength ?? 0;
+        } else if (ev.event === "Progress") {
+          received += ev.data?.chunkLength ?? 0;
+          updateProgress = total > 0 ? Math.round((received / total) * 100) : 0;
+        }
+      });
+      await relaunch();
+    } catch (e) {
+      addLogEntry(`Update failed: ${e}`, "error");
+      appUpdating = false;
+    }
+  }
+
   async function refreshDerived() {
     try {
       derived = await invoke("recommend_settings");
@@ -608,6 +657,23 @@
       </div>
     </div>
   </header>
+
+  {#if updateInfo}
+    <div class="update-banner">
+      <span class="update-text">
+        {t.updateAvailable}: <strong>v{updateInfo.version}</strong>
+        {#if appUpdating}&nbsp;· {t.updateDownloading} {updateProgress}%{/if}
+      </span>
+      {#if processing}
+        <span class="update-busy">{t.updateBusy}</span>
+      {:else}
+        <button class="update-btn" onclick={installAppUpdate} disabled={appUpdating}>
+          {appUpdating ? `${updateProgress}%` : t.updateNow}
+        </button>
+      {/if}
+      <button class="update-dismiss" onclick={() => (updateInfo = null)} disabled={appUpdating}>{t.updateLater}</button>
+    </div>
+  {/if}
 
   <div class="toolbar">
     <button onclick={addFiles}>{t.addFiles}</button>
@@ -1380,6 +1446,39 @@
     white-space: nowrap;
   }
   .hw-warn { color: #f4978e; }
+
+  .update-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 8px 0;
+    padding: 7px 12px;
+    background: #24303c;
+    border: 1px solid #3a5a7a;
+    border-radius: 5px;
+  }
+  .update-text { font-size: 12px; color: #cfe2f3; flex: 1; }
+  .update-busy { font-size: 11px; color: #f0c674; }
+  .update-btn {
+    background: #3a6ea5;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .update-btn:hover:not(:disabled) { background: #4a7eb5; }
+  .update-btn:disabled { opacity: 0.6; cursor: default; }
+  .update-dismiss {
+    background: transparent;
+    color: #8a9aa8;
+    border: none;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 4px 6px;
+  }
+  .update-dismiss:hover:not(:disabled) { color: #ccc; }
 
   .mode-toggle { display: flex; gap: 4px; }
   .mode-toggle button {
