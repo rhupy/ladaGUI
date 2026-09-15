@@ -42,6 +42,11 @@ static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
 /// bounded (~7 GB, verified) while retaining enough temporal context.
 const VR_MAX_CLIP_LENGTH: u32 = 20;
 
+/// Floor for a VR pass's container memory. A 4K eye at VR_MAX_CLIP_LENGTH was
+/// measured peaking near 7 GB, so this leaves headroom while still bounding the
+/// job. Only a floor: a larger configured limit is honoured as-is.
+const VR_MIN_MEMORY_GB: u32 = 8;
+
 /// How many times one engine pass is retried before the job is marked failed.
 /// Previously a pass retried forever, so an unreachable drive produced dozens of
 /// identical 30s retries and the job simply never ended.
@@ -1295,6 +1300,13 @@ async fn copy_with_progress(
     }
 }
 
+/// Container memory for one VR pass, given the configured limit.
+/// 0 means the user explicitly asked for no limit and is left alone; otherwise
+/// the limit is raised to VR_MIN_MEMORY_GB if it is below what a 4K eye needs.
+fn vr_pass_memory_gb(configured: u32) -> u32 {
+    if configured == 0 { 0 } else { configured.max(VR_MIN_MEMORY_GB) }
+}
+
 /// VR (side-by-side) pipeline: stage the source onto the work drive → split L/R
 /// → Lada each half → hstack + audio → stage the result back out.
 ///
@@ -1367,18 +1379,24 @@ async fn process_vr_file(
     if CANCEL_FLAG.load(Ordering::SeqCst) { cleanup(); return; }
 
     // 3) Lada on each eye (work dir mounted as input/output/tmp).
-    // memory_limit=0 (unlimited) + a low clip length: each split eye is 4K, where the
-    // normal (up to 180-frame) clip window needs tens of GB and OOM-kills the container
-    // (exit 137 crash-loop). Capping the VR clip window keeps 4K RAM/VRAM bounded
-    // (~7 GB, verified) while VR's sequential passes make uncapped memory safe.
+    // Each split eye is 4K, where the normal (up to 180-frame) clip window needs
+    // tens of GB and OOM-kills the container (exit 137 crash-loop), so the VR
+    // clip window is capped — which is what actually keeps memory bounded.
+    //
+    // The two passes of one file are sequential, but two VR *files* are not:
+    // with parallel_jobs > 1 an uncapped limit here let several 4K containers
+    // compete with nothing bounding them. Each pass now takes a real limit, at
+    // least VR_MIN_MEMORY_GB, so concurrent VR jobs stay inside Docker's VM.
+    // An explicit 0 (the user asking for unlimited) is still honoured.
     // Each half is deleted once restored, to bound peak disk use.
     let vr_clip = settings.max_clip_length.min(VR_MAX_CLIP_LENGTH);
-    let left_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_left.mp4", "vr_left_out.mp4", settings, 0, vr_clip);
+    let vr_memory = vr_pass_memory_gb(settings.memory_limit);
+    let left_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_left.mp4", "vr_left_out.mp4", settings, vr_memory, vr_clip);
     if !run_lada_pass(app, &left_args, &left_out, index, total_files, file_name, "VR L: ", 12.0, 40.0).await {
         cleanup(); return; // cancelled
     }
     let _ = std::fs::remove_file(&left_in);
-    let right_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_right.mp4", "vr_right_out.mp4", settings, 0, vr_clip);
+    let right_args = build_lada_args(&work_dir_docker, &work_dir_docker, &work_dir_docker, "vr_right.mp4", "vr_right_out.mp4", settings, vr_memory, vr_clip);
     if !run_lada_pass(app, &right_args, &right_out, index, total_files, file_name, "VR R: ", 52.0, 40.0).await {
         cleanup(); return; // cancelled
     }
@@ -1892,6 +1910,27 @@ mod tests {
         assert_eq!(lada_vram_mb_for_clip(999), 3935, "above the measured range clamps");
         let mid = lada_vram_mb_for_clip(135);
         assert!(mid > 2352 && mid < 3149, "135 sits between the 90 and 180 samples, got {mid}");
+    }
+
+    /// Two VR files under parallel_jobs > 1 used to run as uncapped 4K
+    /// containers competing for the whole machine. Every pass must now carry a
+    /// real limit unless the user asked for none.
+    #[test]
+    fn vr_passes_are_memory_bounded() {
+        assert_eq!(vr_pass_memory_gb(9), 9, "a sufficient configured limit is used as-is");
+        assert_eq!(vr_pass_memory_gb(24), 24, "a generous limit is not lowered");
+        assert_eq!(vr_pass_memory_gb(4), VR_MIN_MEMORY_GB, "too low is raised to the 4K floor");
+        assert_eq!(vr_pass_memory_gb(0), 0, "explicit unlimited is still honoured");
+    }
+
+    #[test]
+    fn concurrent_vr_jobs_fit_inside_docker() {
+        // The derived plan for this machine, applied to VR work.
+        let p = hw(32607, 16, 47, 47, 12);
+        let d = derive_settings(&p);
+        let per_pass = vr_pass_memory_gb(d.memory_limit) as u64 * 1024;
+        assert!(per_pass * d.parallel_jobs as u64 <= p.docker_ram_limit_mb,
+            "{} VR jobs at {}MB each must fit in {}MB", d.parallel_jobs, per_pass, p.docker_ram_limit_mb);
     }
 
     #[test]
