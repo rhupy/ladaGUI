@@ -1,31 +1,44 @@
-## Lada GUI v0.6.0
+## Lada GUI v0.7.0
 
-외장하드처럼 **연결이 끊길 수 있는 드라이브에서도 VR 작업이 안정적으로 완주**하도록 구조를 바꾼 릴리스입니다.
-VR jobs now survive a drive that briefly disconnects — the whole point of this release.
+사양을 감지해 **설정을 자동으로 맞춰주고**, 앱 안에서 **새 버전으로 바로 업데이트**할 수 있게 되었습니다.
+This release tunes itself to your hardware and can update itself in place.
 
-### ✨ 핵심 변경 / Key change
+### ✨ 새로운 기능 / New features
 
-- **VR 작업 중 Docker가 원본/출력 드라이브를 아예 건드리지 않습니다**
-- **Docker no longer touches the source/output drive during a VR job**
-  - 이전에는 몇 시간짜리 VR 작업 내내 해당 드라이브를 Docker에 마운트했습니다. 외장하드가 **한 번만 깜빡여도 그 마운트가 죽고**, 윈도우에서 드라이브가 다시 붙어도 **Docker Desktop을 재시작하기 전까지는 복구되지 않아** 작업 전체가 무산됐습니다(`exit 125`, 무한 재시도).
-  - Previously the drive stayed mounted into Docker for the entire multi-hour job. One blink and that mount dies — and it stays dead until Docker Desktop is restarted, even after Windows reattaches the drive. The job was stranded (`exit 125`, retrying forever).
-  - 이제 흐름: **원본을 작업 드라이브로 복사 → 분리·좌안·우안·합성을 전부 작업 드라이브에서 처리 → 완성본만 출력 폴더로 복사.**
-  - New flow: **copy the source to the work drive → split / left eye / right eye / merge entirely there → copy only the finished file back out.**
-  - 두 번의 복사는 Docker가 아니라 **앱이 직접 수행**하므로, 도중에 드라이브가 빠져도 **다시 붙는 즉시 재시도가 성공**합니다. 사용자가 할 일은 없습니다.
-  - Those two copies are plain host file I/O (not Docker), so if the drive drops mid-copy it simply **retries and succeeds as soon as it returns** — no manual steps.
-  - 외장하드 노출 구간이 **"몇 시간" → "복사 두 번"** 으로 줄어듭니다. 추가 시간은 9GB 원본 기준 약 3분(전체 작업의 1~2%)입니다.
-  - Drive exposure shrinks from **hours to two copies**. Overhead is ~3 minutes for a 9 GB source (1–2% of the job).
+- **사양 자동 감지 + 자동 설정 / Hardware detection and auto settings**
+  - GPU·VRAM·CPU 코어·RAM·Docker 메모리 상한·임시폴더 여유를 감지해, **병렬 작업 수 / 클립 길이 / 컨테이너 메모리 / FP16 / 인코더**를 계산해 적용합니다. 설정에서 `자동 ↔ 수동`을 고를 수 있습니다.
+  - Detects GPU/VRAM, CPU cores, RAM, Docker's memory ceiling and free temp space, then sets parallel jobs, clip length, container memory, FP16 and encoder. Switch between `Auto` and `Manual` in settings.
+  - **숫자만 보여주지 않고 근거를 함께 표시합니다** — 예: `4 concurrent jobs — limited by CPU cores (VRAM allows 8, CPU 4, Docker RAM 4)`.
+  - It shows *why*, not just *what* — e.g. `4 concurrent jobs — limited by CPU cores (VRAM allows 8, CPU 4, Docker RAM 4)`.
+  - 추천값은 추측이 아니라 **실측 기반**입니다. RTX 5090에서 클립 길이별 VRAM/처리시간을 직접 측정해 표로 넣었습니다.
+  - The recommendations come from measurements, not guesses: VRAM and processing time were measured per clip length on an RTX 5090.
+  - ⚠️ **기존 사용자의 설정은 그대로 유지됩니다.** 직접 맞춰둔 값을 덮어쓰지 않도록, 자동 모드는 신규 설치에서만 기본으로 켜집니다. 원하면 설정에서 켜세요.
+  - Existing installs keep their settings — auto mode is only the default on a fresh install, so hand-tuned values are never overwritten. Turn it on in settings if you want it.
+- **앱 내 자동 업데이트 / In-app auto-update**
+  - 새 버전이 나오면 상단에 배너가 뜨고, 클릭 한 번으로 내려받아 설치·재시작합니다. 모든 업데이트는 서명으로 검증됩니다.
+  - A banner appears when a new version is out; one click downloads, verifies and installs it. Every update is signature-verified.
+  - **작업 중에는 업데이트할 수 없습니다** — Windows는 설치 과정에서 앱을 종료시키므로, 진행 중인 작업이 사라지지 않도록 막아둡니다.
+  - Updates are blocked while jobs are running: Windows exits the app to install, which would kill work in progress.
 
-### 🛠 그 외 / Also
+### 🐞 버그 수정 / Bug fixes
 
-- 복사 구간에도 진행률이 표시됩니다. 진행률 배분: 복사 0–5% → 분리 5–12% → 좌안 12–52% → 우안 52–92% → 합성 92–97% → 결과 복사 97–100%.
-- The copy stages report progress too: copy-in 0–5% → split 5–12% → left 12–52% → right 52–92% → merge 92–97% → copy-out 97–100%.
-- 중간 파일을 단계마다 즉시 삭제해 작업 드라이브 사용량을 원본의 약 4~5배로 억제합니다. 여유 공간이 부족하면 출력 드라이브로 자동 폴백합니다.
-- Intermediates are deleted as soon as they're consumed, capping work-drive use at ~4–5× the source; if space is short it falls back to the output drive.
-- 원본을 단순한 이름으로 복사해 처리하므로, 파일명의 공백·괄호·한글이 Docker 인자를 거치며 문제를 일으킬 여지가 없습니다.
-- The staged copy uses a plain ASCII name, so spaces/brackets/non-Latin characters in filenames never pass through docker arguments.
-- v0.5.1~0.5.3의 개선(분리·합성 진행률, VR OOM 수정, 드라이브 끊김 안내)이 모두 포함됩니다. 일반 2D 영상 처리 경로는 변경되지 않았습니다.
-- Includes everything from v0.5.1–0.5.3 (split/merge progress, the VR OOM fix, the drive-disconnect hint). The normal 2D path is unchanged.
+- **무한 재시도 중단 / Retries are now bounded**
+  - 외장하드가 빠지는 등으로 실패하면 30초마다 **영원히 재시도**하며 작업이 끝나지 않던 문제를 고쳤습니다. 이제 복구 불가능한 원인(드라이브 유실 등)은 즉시 실패로 처리하고, 그 외에는 최대 10회까지만 간격을 늘려가며 재시도한 뒤 정리합니다.
+  - A failure used to retry every 30s forever — a disconnected drive left a job spinning indefinitely. Unrecoverable causes now fail immediately, and anything else retries at most 10 times with growing backoff.
+  - 포기한 작업이 "처리 중"에 멈춰 있지 않고 **실패로 명확히 표시**됩니다.
+  - A job that gives up is now clearly marked failed instead of sitting on "processing".
+- **VR 동시 처리 시 메모리 초과 / VR jobs could overcommit memory**
+  - VR 작업이 메모리 무제한으로 실행되어, 병렬 작업 수가 2 이상이면 4K 컨테이너 여러 개가 상한 없이 경쟁할 수 있었습니다. 이제 각 패스가 적정 한도를 받습니다.
+  - VR passes ran without a memory limit, so with parallel jobs above 1 several 4K containers could compete unbounded. Each pass now gets a proper limit.
+- 최대 클립 길이 툴팁이 단위를 "초"라고 잘못 안내하던 것을 **"프레임"**으로 수정했습니다.
+- Fixed the max clip length tooltip, which described the unit as seconds when it is frames.
+
+### ℹ️ 참고 / Notes
+
+- **이번 버전은 수동으로 설치해야 합니다.** v0.6.0에는 업데이트 기능이 없어 자동으로 받을 수 없습니다. v0.7.0부터는 앱 안에서 업데이트됩니다.
+- **This one must be installed by hand.** v0.6.0 has no updater, so it cannot fetch this automatically. From v0.7.0 onward updates happen in-app.
+- 설정을 자동으로 바꾸고 싶다면 설정 패널에서 `설정 방식`을 **자동**으로 바꾸세요.
+- To let the app tune itself, set `Settings Mode` to **Auto** in the settings panel.
 
 ---
 
