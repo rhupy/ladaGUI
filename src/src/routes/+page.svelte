@@ -54,6 +54,11 @@
   let errorCount = $state(0);
 
   // Performance
+  // Static machine specs, detected once and used to explain/derive settings.
+  /** @type {any} */
+  let hwProfile = $state(null);
+  let detecting = $state(false);
+
   let perfData = $state({ cpuUsage: 0, ramUsed: 0, ramTotal: 0, ramPercent: 0, gpuUsage: 0, vramUsage: 0, vramTotal: 0, gpuTemp: 0, gpuPower: 0 });
   let perfInterval = null;
 
@@ -86,6 +91,12 @@
     fp16On: lang === "ko" ? "켜기" : "On",
     fp16Off: lang === "ko" ? "끄기" : "Off",
     maxClipLength: lang === "ko" ? "최대 클립 길이" : "Max Clip Length",
+    detectedHardware: lang === "ko" ? "감지된 사양" : "Detected Hardware",
+    redetect: lang === "ko" ? "다시 감지" : "Re-detect",
+    detecting: lang === "ko" ? "감지 중..." : "Detecting...",
+    dockerRamCeiling: lang === "ko" ? "Docker 메모리 상한" : "Docker RAM Ceiling",
+    tempFree: lang === "ko" ? "임시 폴더 여유" : "Temp Free",
+    noGpuDetected: lang === "ko" ? "NVIDIA GPU를 찾지 못했습니다" : "No NVIDIA GPU detected",
     parallelJobsLabel: lang === "ko" ? "병렬 작업 수" : "Parallel Jobs",
     memoryLimitLabel: lang === "ko" ? "컨테이너 메모리" : "Memory Limit",
     encoderLabel: lang === "ko" ? "인코더" : "Encoder",
@@ -191,6 +202,7 @@
   onMount(async () => {
     // App version → header + OS window title
     try {
+      detectHardware();
       appVersion = await getVersion();
       await getCurrentWindow().setTitle(`Lada GUI v${appVersion} - Mosaic Removal`);
     } catch (e) {
@@ -454,6 +466,18 @@
     }
   }
 
+  async function detectHardware(force = false) {
+    detecting = true;
+    try {
+      hwProfile = await invoke("detect_hardware", { force });
+    } catch (e) {
+      console.error("Hardware detection failed:", e);
+      addLogEntry(`Hardware detection failed: ${e}`, "error");
+    } finally {
+      detecting = false;
+    }
+  }
+
   async function fetchPerfData() {
     try {
       const stats = await invoke("get_system_stats");
@@ -561,6 +585,48 @@
 
   {#if activePanel === "settings"}
     <div class="settings-panel">
+      <div class="hw-block">
+        <div class="hw-head">
+          <span class="hw-title">{t.detectedHardware}</span>
+          <button class="hw-redetect" onclick={() => detectHardware(true)} disabled={detecting}>
+            {detecting ? t.detecting : t.redetect}
+          </button>
+        </div>
+        {#if hwProfile}
+          <div class="perf-row">
+            <span class="perf-label">GPU</span>
+            <span class="hw-value">
+              {#if hwProfile.gpu_name}
+                {hwProfile.gpu_name} · {(hwProfile.vram_total_mb / 1024).toFixed(0)}GB
+                {#if hwProfile.gpu_count > 1}&nbsp;× {hwProfile.gpu_count}{/if}
+                &nbsp;· CC {hwProfile.compute_cap} · {hwProfile.driver_version}
+              {:else}
+                <span class="hw-warn">{t.noGpuDetected}</span>
+              {/if}
+            </span>
+          </div>
+          <div class="perf-row">
+            <span class="perf-label">CPU</span>
+            <span class="hw-value">{hwProfile.cpu_name} · {hwProfile.cpu_physical_cores}C/{hwProfile.cpu_logical_cores}T</span>
+          </div>
+          <div class="perf-row">
+            <span class="perf-label">RAM</span>
+            <span class="hw-value">{(hwProfile.ram_total_mb / 1024).toFixed(0)}GB</span>
+          </div>
+          <div class="perf-row">
+            <span class="perf-label">{t.dockerRamCeiling}</span>
+            <span class="hw-value">
+              {hwProfile.docker_ram_limit_mb > 0 ? (hwProfile.docker_ram_limit_mb / 1024).toFixed(0) + "GB" : "—"}
+            </span>
+          </div>
+          <div class="perf-row">
+            <span class="perf-label">{t.tempFree}</span>
+            <span class="hw-value">{hwProfile.temp_free_gb}GB</span>
+          </div>
+        {:else}
+          <div class="perf-row"><span class="hw-value">{detecting ? t.detecting : "—"}</span></div>
+        {/if}
+      </div>
       <div class="setting-row">
         <label>{t.detectionModel}</label>
         <select bind:value={detectionModel} disabled={processing} onchange={persistSettings}>
@@ -1209,6 +1275,44 @@
   .perf-panel {
     max-height: 200px;
   }
+  .hw-block {
+    border-bottom: 1px solid #2a2a2a;
+    padding-bottom: 8px;
+    margin-bottom: 8px;
+  }
+  .hw-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  .hw-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #888;
+  }
+  .hw-redetect {
+    background: #2a2a2a;
+    color: #ccc;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .hw-redetect:hover:not(:disabled) { background: #333; }
+  .hw-redetect:disabled { opacity: 0.5; cursor: default; }
+  .hw-value {
+    font-size: 11px;
+    color: #bbb;
+    text-align: right;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hw-warn { color: #f4978e; }
+
   .perf-row {
     display: flex;
     align-items: center;

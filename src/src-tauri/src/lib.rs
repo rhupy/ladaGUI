@@ -156,6 +156,147 @@ async fn get_system_stats() -> Result<SystemStats, String> {
     })
 }
 
+/// Static machine specs used to derive good settings. Distinct from
+/// `SystemStats`, which is live usage polled for the performance panel.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct HardwareProfile {
+    gpu_name: String,
+    gpu_count: u32,
+    vram_total_mb: u64,
+    compute_cap: String,
+    compute_cap_major: u32,
+    driver_version: String,
+    driver_major: u32,
+    nvenc_present: bool,
+    cpu_name: String,
+    cpu_physical_cores: u32,
+    cpu_logical_cores: u32,
+    ram_total_mb: u64,
+    /// Docker Desktop's WSL2 VM ceiling. This, not host RAM, is what container
+    /// memory limits actually have to fit inside: measured equal to host RAM on
+    /// one machine, but it defaults to a fraction of it on others.
+    docker_ram_limit_mb: u64,
+    docker_ok: bool,
+    docker_gpu_ok: bool,
+    temp_dir: String,
+    temp_free_gb: u64,
+    detected_at: String,
+}
+
+static HW_CACHE: std::sync::LazyLock<Mutex<Option<HardwareProfile>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// Query the GPU via nvidia-smi. Returns one entry per GPU.
+async fn probe_gpus() -> Vec<(String, u64, String, String)> {
+    let mut cmd = Command::new("nvidia-smi");
+    cmd.args([
+        "--query-gpu=name,memory.total,compute_cap,driver_version",
+        "--format=csv,noheader,nounits",
+    ]);
+    hide_window(&mut cmd);
+    let out = match cmd.output().await {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let p: Vec<&str> = line.split(',').map(|x| x.trim()).collect();
+            if p.len() < 4 {
+                return None;
+            }
+            Some((
+                p[0].to_string(),
+                p[1].parse::<u64>().unwrap_or(0),
+                p[2].to_string(),
+                p[3].to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Docker Desktop's VM memory ceiling in MB, via `docker info`.
+async fn probe_docker_ram_limit() -> u64 {
+    let mut cmd = Command::new("docker");
+    cmd.args(["info", "--format", "{{.MemTotal}}"]);
+    hide_window(&mut cmd);
+    match cmd.output().await {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0)
+            / (1024 * 1024),
+        _ => 0,
+    }
+}
+
+/// Leading integer of a version string ("616.92" -> 616).
+fn version_major(v: &str) -> u32 {
+    v.split('.').next().and_then(|x| x.parse().ok()).unwrap_or(0)
+}
+
+#[tauri::command]
+async fn detect_hardware(force: bool) -> Result<HardwareProfile, String> {
+    if !force {
+        if let Some(cached) = HW_CACHE.lock().unwrap().clone() {
+            return Ok(cached);
+        }
+    }
+
+    let gpus = probe_gpus().await;
+    let (gpu_name, vram_total_mb, compute_cap, driver_version) = gpus
+        .first()
+        .cloned()
+        .unwrap_or_else(|| (String::new(), 0, String::new(), String::new()));
+
+    let (cpu_name, cpu_physical_cores, cpu_logical_cores, ram_total_mb) = {
+        let mut sys = SYS_INFO.lock().unwrap();
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        (
+            sys.cpus().first().map(|c| c.brand().trim().to_string()).unwrap_or_default(),
+            sys.physical_core_count().unwrap_or(0) as u32,
+            sys.cpus().len() as u32,
+            sys.total_memory() / (1024 * 1024),
+        )
+    };
+
+    let docker_status = check_docker().await;
+    let docker_ok = docker_status.is_ok();
+    let docker_gpu_ok = docker_status.map(|s| s.contains("NVIDIA")).unwrap_or(false);
+    let docker_ram_limit_mb = if docker_ok { probe_docker_ram_limit().await } else { 0 };
+
+    let temp_dir = std::env::temp_dir();
+    let temp_free_gb = available_space_for(&temp_dir).unwrap_or(0) / 1_000_000_000;
+
+    let profile = HardwareProfile {
+        gpu_count: gpus.len() as u32,
+        compute_cap_major: version_major(&compute_cap),
+        driver_major: version_major(&driver_version),
+        // Every NVIDIA GPU Lada can realistically run on has NVENC; treat the
+        // presence of a CUDA GPU as the signal rather than probing encoders.
+        nvenc_present: !gpu_name.is_empty(),
+        gpu_name,
+        vram_total_mb,
+        compute_cap,
+        driver_version,
+        cpu_name,
+        cpu_physical_cores,
+        cpu_logical_cores,
+        ram_total_mb,
+        docker_ram_limit_mb,
+        docker_ok,
+        docker_gpu_ok,
+        temp_dir: temp_dir.to_string_lossy().to_string(),
+        temp_free_gb,
+        detected_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    };
+
+    *HW_CACHE.lock().unwrap() = Some(profile.clone());
+    Ok(profile)
+}
+
 fn write_log(msg: &str) {
     let log_path = std::env::current_exe()
         .ok()
@@ -1356,6 +1497,7 @@ pub fn run() {
             save_settings,
             load_settings,
             get_system_stats,
+            detect_hardware,
             shutdown_pc,
         ])
         .setup(|app| {
