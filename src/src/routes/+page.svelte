@@ -119,8 +119,8 @@
       ? "반정밀도 연산. VRAM 절약 + 최신 GPU에서 속도 향상\n화질 차이는 거의 없음\n\n자동: GPU 지원 여부를 Lada가 판단 (권장)\n켜기: 강제 사용 (구형 GPU는 실패할 수 있음)\n끄기: 강제 비활성 (FP32)"
       : "Half-precision compute. Saves VRAM + faster on modern GPUs\nNegligible quality difference\n\nAuto: Let Lada decide based on GPU (recommended)\nOn: Force enable (may fail on old GPUs)\nOff: Force disable (FP32)",
     maxClipLength: lang === "ko"
-      ? "영상을 분할 처리하는 최대 길이(초)\nVRAM 부족 시 낮추세요"
-      : "Max segment length in seconds\nLower if running out of VRAM",
+      ? "복원 단위 클립의 최대 프레임 수 (초 아님)\n클수록 시간적 안정성↑, VRAM 사용량↑\n180을 넘으면 속도 이득은 거의 없고 VRAM만 늘어남\n너무 작으면 오히려 느려짐\nVRAM 부족 시 낮추세요"
+      : "Max frames per restoration clip (frames, not seconds)\nHigher = better temporal stability, more VRAM\nPast ~180 speed plateaus while VRAM keeps growing\nToo low is slower, not faster\nLower if running out of VRAM",
     parallelJobs: lang === "ko"
       ? "동시 처리 영상 수. VRAM 사용량 × N\n\nRTX 3060 12GB: 1~2개\nRTX 3080/4070: 2~3개\nRTX 4080/4090: 3~6개\nRTX 5090: 4~8개"
       : "Number of concurrent videos. VRAM usage × N\n\nRTX 3060 12GB: 1-2\nRTX 3080/4070: 2-3\nRTX 4080/4090: 3-6\nRTX 5090: 4-8",

@@ -42,6 +42,42 @@ static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
 /// bounded (~7 GB, verified) while retaining enough temporal context.
 const VR_MAX_CLIP_LENGTH: u32 = 20;
 
+/// How many times one engine pass is retried before the job is marked failed.
+/// Previously a pass retried forever, so an unreachable drive produced dozens of
+/// identical 30s retries and the job simply never ended.
+const MAX_PASS_ATTEMPTS: u32 = 10;
+
+/// Whether a failed pass is worth retrying at all.
+enum ExitClass {
+    /// Could plausibly succeed later (GPU hiccup, transient I/O, a sibling job
+    /// freeing memory).
+    Transient,
+    /// Repeats identically however many times we try.
+    Fatal,
+}
+
+/// Classify a failed run and return a human-readable hint to show with it.
+fn classify_exit(code: Option<i32>, stderr_tail: &str) -> (ExitClass, &'static str) {
+    match code {
+        // Docker refused to create the container. Together with a mount-source
+        // error this is a drive that went away: Docker Desktop holds the broken
+        // mount until it is restarted, so retrying alone can never recover.
+        Some(125) if stderr_tail.contains("mount source path") => (
+            ExitClass::Fatal,
+            " [drive unavailable — reconnect it, then restart Docker Desktop]",
+        ),
+        // Entrypoint missing or not executable.
+        Some(126) | Some(127) => (ExitClass::Fatal, " [engine not runnable]"),
+        // SIGKILL — normally the container memory limit. Kept transient because
+        // with parallel jobs a peak can clear once a sibling job finishes.
+        Some(137) => (
+            ExitClass::Transient,
+            " [killed, likely out of memory — raise the memory limit or lower max clip length]",
+        ),
+        _ => (ExitClass::Transient, ""),
+    }
+}
+
 static SYS_INFO: std::sync::LazyLock<Mutex<System>> = std::sync::LazyLock::new(|| {
     let mut sys = System::new_all();
     sys.refresh_cpu_all();
@@ -131,14 +167,17 @@ fn write_log(msg: &str) {
     }
 }
 
+/// `#[serde(default)]` on the container (not per field) so that adding a field
+/// here can never break loading an older settings.json, and so a frontend that
+/// lags the struct still deserializes. Never add `deny_unknown_fields`: a user
+/// downgrading the app must still be able to load a newer settings.json.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LadaSettings {
     detection_model: String,
-    #[serde(default = "default_restoration_model")]
     restoration_model: String,
-    #[serde(default = "default_fp16")]
     fp16: String, // "auto" | "on" | "off"
-    max_clip_length: u32,
+    max_clip_length: u32, // frames, not seconds
     encoder: String,
     crf: u32,
     preset: String,
@@ -148,13 +187,30 @@ pub struct LadaSettings {
     delete_original: bool,
     shutdown_after: bool,
     parallel_jobs: u32,
-    #[serde(default = "default_memory_limit")]
     memory_limit: u32, // GB per container, 0 = unlimited
 }
 
-fn default_memory_limit() -> u32 { 10 }
-fn default_restoration_model() -> String { "basicvsrpp-v1.2".to_string() }
-fn default_fp16() -> String { "auto".to_string() }
+/// Must stay in sync with the frontend's `$state` defaults in +page.svelte.
+impl Default for LadaSettings {
+    fn default() -> Self {
+        Self {
+            detection_model: "v4-accurate".to_string(),
+            restoration_model: "basicvsrpp-v1.2".to_string(),
+            fp16: "auto".to_string(),
+            max_clip_length: 300,
+            encoder: "hevc_nvenc".to_string(),
+            crf: 18,
+            preset: "medium".to_string(),
+            prefix: "[nm]".to_string(),
+            same_directory: true,
+            output_directory: String::new(),
+            delete_original: true,
+            shutdown_after: false,
+            parallel_jobs: 1,
+            memory_limit: 10,
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 struct ProgressPayload {
@@ -608,6 +664,10 @@ async fn run_lada_pass(
         attempt += 1;
         if CANCEL_FLAG.load(Ordering::SeqCst) { return false; }
 
+        // Log the exact command. This is how a refactor is proven not to have
+        // changed what actually gets run.
+        write_log(&format!("SPAWN file=\"{}\" {}attempt={} docker {}", file_name, label, attempt, args.join(" ")));
+
         let mut cmd = Command::new("docker");
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         cmd.args(&arg_refs);
@@ -702,18 +762,35 @@ async fn run_lada_pass(
             return true;
         } else {
             let stderr_tail = last_stderr_lines.join("\n");
-            // Docker exit 125 + a mount-source error almost always means the drive
-            // holding the video (or the work dir) went away — a disconnected
-            // external disk, or Docker Desktop losing that drive share.
-            let hint = if status.code() == Some(125) && stderr_tail.contains("mount source path") {
-                " [drive unavailable — check the drive is connected, then restart Docker Desktop]"
-            } else {
-                ""
-            };
+            let (class, hint) = classify_exit(status.code(), &stderr_tail);
+            let _ = std::fs::remove_file(expected_output); // drop any partial output
+
+            // Give up rather than burn cycles forever: a fatal cause repeats
+            // identically on every retry, and even a transient one is hopeless
+            // after this many tries.
+            if matches!(class, ExitClass::Fatal) || attempt >= MAX_PASS_ATTEMPTS {
+                let why = if matches!(class, ExitClass::Fatal) {
+                    format!("exit code {:?}.{}", status.code(), hint)
+                } else {
+                    format!("gave up after {} attempts. Last exit code {:?}.{}", attempt, status.code(), hint)
+                };
+                let error_msg = format!("{}Failed: {}\n{}", label, why, stderr_tail);
+                write_log(&format!("FAIL file=\"{}\" {}attempt={} {}", file_name, label, attempt, error_msg.replace('\n', " | ")));
+                let _ = app.emit("progress", ProgressPayload {
+                    file_index: index, total_files,
+                    file_name: file_name.to_string(), progress: pct_base,
+                    status: "error".to_string(), message: error_msg,
+                    remaining: String::new(), speed: String::new(),
+                });
+                return false;
+            }
+
+            // Exponential backoff, capped — a flat 30s just hammers a dead drive.
+            let backoff = (30u64 << (attempt - 1).min(4)).min(300);
             let error_msg = if status.success() && !output_valid {
-                format!("{}Attempt {}: output missing. Retrying in 30s...\n{}", label, attempt, stderr_tail)
+                format!("{}Attempt {}: output missing. Retrying in {}s...\n{}", label, attempt, backoff, stderr_tail)
             } else {
-                format!("{}Attempt {}: exit code {:?}.{} Retrying in 30s...\n{}", label, attempt, status.code(), hint, stderr_tail)
+                format!("{}Attempt {}: exit code {:?}.{} Retrying in {}s...\n{}", label, attempt, status.code(), hint, backoff, stderr_tail)
             };
             write_log(&format!("RETRY file=\"{}\" {}attempt={} error: {}", file_name, label, attempt, error_msg.replace('\n', " | ")));
             let _ = app.emit("progress", ProgressPayload {
@@ -722,8 +799,7 @@ async fn run_lada_pass(
                 status: "processing".to_string(), message: error_msg,
                 remaining: String::new(), speed: String::new(),
             });
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let _ = std::fs::remove_file(expected_output);
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         }
     }
 }
@@ -1226,4 +1302,119 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exactly what the current frontend's getSettingsObj() sends, and what an
+    /// existing installed settings.json looks like today.
+    const CURRENT_SETTINGS_JSON: &str = r#"{
+        "detection_model": "v4-accurate",
+        "restoration_model": "basicvsrpp-v1.2",
+        "fp16": "auto",
+        "max_clip_length": 300,
+        "encoder": "hevc_nvenc",
+        "crf": 18,
+        "preset": "medium",
+        "prefix": "[nm]",
+        "same_directory": true,
+        "output_directory": "",
+        "delete_original": true,
+        "shutdown_after": false,
+        "parallel_jobs": 1,
+        "memory_limit": 10
+    }"#;
+
+    #[test]
+    fn loads_todays_settings_file_unchanged() {
+        let s: LadaSettings = serde_json::from_str(CURRENT_SETTINGS_JSON).expect("must parse");
+        assert_eq!(s.detection_model, "v4-accurate");
+        assert_eq!(s.max_clip_length, 300);
+        assert_eq!(s.parallel_jobs, 1);
+        assert_eq!(s.memory_limit, 10);
+        assert!(s.same_directory && s.delete_original && !s.shutdown_after);
+    }
+
+    /// A settings.json written before restoration_model / fp16 / memory_limit
+    /// existed must still load, with those fields falling back to defaults.
+    #[test]
+    fn loads_older_settings_file_with_missing_fields() {
+        let older = r#"{"detection_model":"v2","max_clip_length":180,"encoder":"libx265",
+            "crf":20,"preset":"slow","prefix":"[x]","same_directory":false,
+            "output_directory":"D:/out","delete_original":false,"shutdown_after":true,
+            "parallel_jobs":3}"#;
+        let s: LadaSettings = serde_json::from_str(older).expect("older config must still load");
+        let d = LadaSettings::default();
+        assert_eq!(s.restoration_model, d.restoration_model);
+        assert_eq!(s.fp16, d.fp16);
+        assert_eq!(s.memory_limit, d.memory_limit);
+        // ...while the fields it did carry are preserved.
+        assert_eq!(s.detection_model, "v2");
+        assert_eq!(s.parallel_jobs, 3);
+        assert_eq!(s.output_directory, "D:/out");
+    }
+
+    /// Downgrading the app must not brick settings: a file written by a newer
+    /// build carries fields this build has never heard of.
+    #[test]
+    fn ignores_unknown_fields_from_a_newer_build() {
+        let newer = r#"{"detection_model":"v4-fast","engine":"jasna",
+            "settings_mode":"auto","some_future_field":{"nested":true}}"#;
+        let s: LadaSettings = serde_json::from_str(newer).expect("unknown fields must be ignored");
+        assert_eq!(s.detection_model, "v4-fast");
+        assert_eq!(s.max_clip_length, LadaSettings::default().max_clip_length);
+    }
+
+    #[test]
+    fn empty_object_yields_defaults() {
+        let s: LadaSettings = serde_json::from_str("{}").expect("must parse");
+        let d = LadaSettings::default();
+        assert_eq!(s.encoder, d.encoder);
+        assert_eq!(s.crf, d.crf);
+        assert_eq!(s.prefix, d.prefix);
+    }
+
+    #[test]
+    fn settings_survive_a_save_load_round_trip() {
+        let mut original = LadaSettings::default();
+        original.parallel_jobs = 4;
+        original.max_clip_length = 180;
+        original.prefix = "[test]".to_string();
+        let json = serde_json::to_string(&original).expect("serialize");
+        let back: LadaSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.parallel_jobs, 4);
+        assert_eq!(back.max_clip_length, 180);
+        assert_eq!(back.prefix, "[test]");
+    }
+
+    #[test]
+    fn a_lost_drive_is_fatal_not_retried_forever() {
+        let stderr = "docker: Error response from daemon: error while creating mount \
+                      source path '/run/desktop/mnt/host/y/x': mkdir /run/desktop/mnt/host/y: file exists";
+        let (class, hint) = classify_exit(Some(125), stderr);
+        assert!(matches!(class, ExitClass::Fatal));
+        assert!(hint.contains("drive unavailable"));
+    }
+
+    #[test]
+    fn oom_is_retryable_because_a_sibling_job_may_free_memory() {
+        let (class, hint) = classify_exit(Some(137), "");
+        assert!(matches!(class, ExitClass::Transient));
+        assert!(hint.contains("memory"));
+    }
+
+    #[test]
+    fn unknown_failures_are_retried() {
+        assert!(matches!(classify_exit(Some(1), "").0, ExitClass::Transient));
+        assert!(matches!(classify_exit(None, "").0, ExitClass::Transient));
+        // ...but a plain 125 without a mount error is not assumed to be the drive.
+        assert!(matches!(classify_exit(Some(125), "some other daemon error").0, ExitClass::Transient));
+    }
+
+    #[test]
+    fn missing_entrypoint_is_fatal() {
+        assert!(matches!(classify_exit(Some(127), "").0, ExitClass::Fatal));
+    }
 }
