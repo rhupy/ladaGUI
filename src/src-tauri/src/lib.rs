@@ -640,10 +640,41 @@ fn merge_lr_args(
     args
 }
 
-/// Run one Lada job (with infinite retry-until-cancel), streaming progress
-/// mapped into [pct_base, pct_base + pct_span] of the overall file progress.
+/// How to read one engine's progress output. Engines differ only in their
+/// wording, so the run loop itself stays shared.
+struct ProgressGrammar {
+    /// Captures the percentage complete.
+    pct: Regex,
+    /// Captures a "time remaining" value, when the engine reports one.
+    remaining: Option<Regex>,
+    /// Captures a throughput value, when the engine reports one.
+    speed: Option<Regex>,
+    /// Reduces a matching line to the short text shown on the job card.
+    detail: fn(&str) -> String,
+}
+
+static LADA_GRAMMAR: std::sync::LazyLock<ProgressGrammar> = std::sync::LazyLock::new(|| ProgressGrammar {
+    pct: Regex::new(r"Processing video:\s+(\d+)%").unwrap(),
+    remaining: Some(Regex::new(r"Remaining:\s*(\S+)").unwrap()),
+    speed: Some(Regex::new(r"Speed:\s*(\S+)").unwrap()),
+    detail: extract_progress_detail,
+});
+
+/// Which stream an engine writes its progress to. The other one is still
+/// drained, so a chatty engine can never fill a pipe and wedge itself.
+#[derive(Clone, Copy)]
+enum StreamSel {
+    Stderr,
+    /// Used by engines that report progress on stdout. Which stream JASNA uses
+    /// is experiment E1 in the plan, so this stays unconstructed until then.
+    #[allow(dead_code)]
+    Stdout,
+}
+
+/// Run one Lada job, streaming progress mapped into
+/// [pct_base, pct_base + pct_span] of the overall file progress.
 /// `expected_output` is the host path that must exist (>1KB) to count as success.
-/// Returns true on success, false if cancelled.
+/// Returns true on success, false if cancelled or failed.
 async fn run_lada_pass(
     app: &tauri::AppHandle,
     args: &[String],
@@ -655,10 +686,30 @@ async fn run_lada_pass(
     pct_base: f64,
     pct_span: f64,
 ) -> bool {
-    let progress_re = Regex::new(r"Processing video:\s+(\d+)%").unwrap();
-    let remaining_re = Regex::new(r"Remaining:\s*(\S+)").unwrap();
-    let speed_re = Regex::new(r"Speed:\s*(\S+)").unwrap();
+    run_engine_pass(
+        app, "docker", args, &LADA_GRAMMAR, StreamSel::Stderr, expected_output,
+        index, total_files, file_name, label, pct_base, pct_span,
+    ).await
+}
 
+/// Run one engine invocation with retry, cancellation and progress streaming.
+/// Engine-specific bits are the program, the argument vector, which stream the
+/// progress appears on, and the grammar used to read it.
+#[allow(clippy::too_many_arguments)]
+async fn run_engine_pass(
+    app: &tauri::AppHandle,
+    program: &str,
+    args: &[String],
+    grammar: &ProgressGrammar,
+    stream_sel: StreamSel,
+    expected_output: &std::path::Path,
+    index: usize,
+    total_files: usize,
+    file_name: &str,
+    label: &str,
+    pct_base: f64,
+    pct_span: f64,
+) -> bool {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -666,9 +717,9 @@ async fn run_lada_pass(
 
         // Log the exact command. This is how a refactor is proven not to have
         // changed what actually gets run.
-        write_log(&format!("SPAWN file=\"{}\" {}attempt={} docker {}", file_name, label, attempt, args.join(" ")));
+        write_log(&format!("SPAWN file=\"{}\" {}attempt={} {} {}", file_name, label, attempt, program, args.join(" ")));
 
-        let mut cmd = Command::new("docker");
+        let mut cmd = Command::new(program);
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         cmd.args(&arg_refs);
         cmd.stdout(std::process::Stdio::piped());
@@ -690,8 +741,28 @@ async fn run_lada_pass(
             }
         };
 
-        let stderr = child.stderr.take().unwrap();
-        let mut reader = BufReader::new(stderr);
+        // Read progress from the engine's chosen stream; drain the other one in
+        // the background so a full pipe can never block the child.
+        let (progress_pipe, spare_pipe): (
+            Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+            Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        ) = match stream_sel {
+            StreamSel::Stderr => (
+                Box::new(child.stderr.take().unwrap()),
+                Box::new(child.stdout.take().unwrap()),
+            ),
+            StreamSel::Stdout => (
+                Box::new(child.stdout.take().unwrap()),
+                Box::new(child.stderr.take().unwrap()),
+            ),
+        };
+        let spare_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut BufReader::new(spare_pipe), &mut buf).await;
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        let mut reader = BufReader::new(progress_pipe);
         let mut last_stderr_lines: Vec<String> = Vec::new();
 
         let mut line_buf = Vec::new();
@@ -713,13 +784,15 @@ async fn run_lada_pass(
                             last_stderr_lines.push(line.clone());
                             if last_stderr_lines.len() > 10 { last_stderr_lines.remove(0); }
 
-                            if let Some(caps) = progress_re.captures(&line) {
+                            if let Some(caps) = grammar.pct.captures(&line) {
                                 if let Ok(pct) = caps[1].parse::<f64>() {
-                                    let rem = remaining_re.captures(&line)
+                                    let rem = grammar.remaining.as_ref()
+                                        .and_then(|re| re.captures(&line))
                                         .map(|c| c[1].to_string()).unwrap_or_default();
-                                    let spd = speed_re.captures(&line)
+                                    let spd = grammar.speed.as_ref()
+                                        .and_then(|re| re.captures(&line))
                                         .map(|c| c[1].to_string()).unwrap_or_default();
-                                    let detail = extract_progress_detail(&line);
+                                    let detail = (grammar.detail)(&line);
                                     let msg = if attempt > 1 {
                                         format!("{}[Retry #{}] {}", label, attempt, detail)
                                     } else {
@@ -761,7 +834,17 @@ async fn run_lada_pass(
             write_log(&format!("PASS-OK file=\"{}\" {}attempts={}", file_name, label, attempt));
             return true;
         } else {
-            let stderr_tail = last_stderr_lines.join("\n");
+            // Diagnostics can land on either stream depending on the engine, so
+            // classify against both.
+            let spare_tail = spare_task.await.unwrap_or_default();
+            let mut stderr_tail = last_stderr_lines.join("\n");
+            let spare_tail = spare_tail.trim();
+            if !spare_tail.is_empty() {
+                let tail: Vec<&str> = spare_tail.lines().rev().take(10).collect();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                if !stderr_tail.is_empty() { stderr_tail.push('\n'); }
+                stderr_tail.push_str(&tail.join("\n"));
+            }
             let (class, hint) = classify_exit(status.code(), &stderr_tail);
             let _ = std::fs::remove_file(expected_output); // drop any partial output
 
@@ -1411,6 +1494,33 @@ mod tests {
         assert!(matches!(classify_exit(None, "").0, ExitClass::Transient));
         // ...but a plain 125 without a mount error is not assumed to be the drive.
         assert!(matches!(classify_exit(Some(125), "some other daemon error").0, ExitClass::Transient));
+    }
+
+    /// Locks in the Lada progress grammar after it was extracted out of
+    /// run_lada_pass, so a future engine refactor cannot silently stop parsing.
+    #[test]
+    fn lada_grammar_parses_a_progress_line() {
+        let line = "Processing video:  42%|####      | Processed: 1234/2900, Remaining: 00:03:21, Speed: 12.3f/s";
+
+        let caps = LADA_GRAMMAR.pct.captures(line).expect("percent must match");
+        assert_eq!(&caps[1], "42");
+
+        let rem = LADA_GRAMMAR.remaining.as_ref().unwrap().captures(line).unwrap()[1].to_string();
+        assert_eq!(rem, "00:03:21,");
+
+        let spd = LADA_GRAMMAR.speed.as_ref().unwrap().captures(line).unwrap()[1].to_string();
+        assert_eq!(spd, "12.3f/s");
+
+        // The card label keeps only the processed count: remaining and speed are
+        // emitted in their own fields and rendered on the right of the row.
+        let detail = (LADA_GRAMMAR.detail)(line);
+        assert_eq!(detail, "Processed: 1234/2900");
+    }
+
+    #[test]
+    fn lada_grammar_ignores_unrelated_output() {
+        assert!(LADA_GRAMMAR.pct.captures("Loading model weights...").is_none());
+        assert!(LADA_GRAMMAR.pct.captures("").is_none());
     }
 
     #[test]
