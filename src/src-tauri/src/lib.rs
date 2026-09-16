@@ -37,6 +37,32 @@ use std::sync::Mutex;
 
 static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
 
+/// PIDs of engine processes currently running. cancel_processing stops Docker
+/// containers by image name, which cannot reach a native jasna.exe; this is
+/// how it reaches those.
+static LIVE_CHILDREN: std::sync::LazyLock<Mutex<Vec<u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn register_child(pid: u32) { LIVE_CHILDREN.lock().unwrap().push(pid); }
+fn unregister_child(pid: u32) { LIVE_CHILDREN.lock().unwrap().retain(|p| *p != pid); }
+
+/// Kill a process and everything it spawned. A frozen-Python engine forks
+/// helpers (JASNA spawns a compilation subprocess), which a plain kill of the
+/// parent would orphan.
+fn kill_child_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut k = std::process::Command::new("taskkill");
+        k.args(["/T", "/F", "/PID", &pid.to_string()]);
+        hide_window_std(&mut k);
+        let _ = k.output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
+}
+
 /// Max Lada clip window for VR (per-eye 4K) passes. The 2D default (up to 180)
 /// needs tens of GB at 4K and OOM-kills the container; 20 keeps RAM/VRAM
 /// bounded (~7 GB, verified) while retaining enough temporal context.
@@ -63,6 +89,11 @@ enum ExitClass {
 
 /// Classify a failed run and return a human-readable hint to show with it.
 fn classify_exit(code: Option<i32>, stderr_tail: &str) -> (ExitClass, &'static str) {
+    // A native engine reports a missing input as a Python traceback with a
+    // generic exit 1; the file will not appear on retry.
+    if stderr_tail.contains("FileNotFoundError") {
+        return (ExitClass::Fatal, " [input file not found]");
+    }
     match code {
         // Docker refused to create the container. Together with a mount-source
         // error this is a drive that went away: Docker Desktop holds the broken
@@ -569,6 +600,9 @@ async fn update_lada() -> Result<String, String> {
 #[tauri::command]
 async fn cancel_processing() -> Result<(), String> {
     CANCEL_FLAG.store(true, Ordering::SeqCst);
+    // Native engines (jasna.exe) are not Docker containers; stop them by PID.
+    let pids: Vec<u32> = LIVE_CHILDREN.lock().unwrap().clone();
+    for pid in pids { kill_child_tree(pid); }
     // Stop ALL running lada containers (fixes #14: multiple parallel jobs)
     let mut cmd = Command::new("docker");
     cmd.args(["ps", "-q", "--filter", "ancestor=ladaapp/lada:latest"]);
@@ -1117,7 +1151,7 @@ async fn run_engine_pass(
         hide_window(&mut cmd);
 
         let mut child = match cmd.spawn() {
-            Ok(c) => c,
+            Ok(c) => { if let Some(pid) = c.id() { register_child(pid); } c }
             Err(e) => {
                 let _ = app.emit("progress", ProgressPayload {
                     file_index: index, total_files,
@@ -1206,9 +1240,11 @@ async fn run_engine_pass(
             }
         }
 
+        let child_pid = child.id();
         let status = match child.wait().await {
-            Ok(s) => s,
+            Ok(s) => { if let Some(pid) = child_pid { unregister_child(pid); } s }
             Err(e) => {
+                if let Some(pid) = child_pid { unregister_child(pid); }
                 write_log(&format!("RETRY file=\"{}\" {}attempt={} error: process wait failed: {}", file_name, label, attempt, e));
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 continue;
@@ -1601,7 +1637,151 @@ async fn process_vr_file(
     write_log(&format!("DONE(VR) file=\"{}\" output=\"{}\"", file_name, output_filename));
 }
 
+/// JASNA's codec names, from our encoder setting. Every NVIDIA codec JASNA
+/// offers is hardware-encoded, so the nvenc/libx distinction collapses.
+fn jasna_codec_for(encoder: &str) -> &'static str {
+    if encoder.contains("264") { "h264" } else { "hevc" }
+}
+
+/// Only JASNA's own model names may be passed through; a Lada model name
+/// ("v4-accurate") would make JASNA fail to start. Anything else is omitted so
+/// JASNA falls back to its default detector (rfdetr-v6).
+fn is_jasna_detection_model(name: &str) -> bool {
+    name.starts_with("rfdetr") || name.starts_with("zelefans") || name.starts_with("lada-yolo")
+}
+
+/// Argument vector for one jasna.exe job. Native paths throughout — nothing
+/// here goes near Docker. VR is left to `--vr-mode auto`: JASNA splits and
+/// rejoins the eyes inside its own pipeline, so our split/merge path is
+/// bypassed entirely on this engine. `--log-level info` is required, since
+/// the default of `error` prints no progress at all.
+fn build_jasna_args(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    working_dir: &std::path::Path,
+    settings: &LadaSettings,
+    clip_length: u32,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--input".into(), input.to_string_lossy().to_string(),
+        "--output".into(), output.to_string_lossy().to_string(),
+        "--working-directory".into(), working_dir.to_string_lossy().to_string(),
+        "--log-level".into(), "info".into(),
+        "--vr-mode".into(), "auto".into(),
+        "--max-clip-size".into(), clip_length.to_string(),
+        "--codec".into(), jasna_codec_for(&settings.encoder).into(),
+        "--cq".into(), settings.crf.clamp(1, 51).to_string(),
+    ];
+    if is_jasna_detection_model(&settings.detection_model) {
+        args.push("--detection-model".into());
+        args.push(settings.detection_model.clone());
+    }
+    match settings.fp16.as_str() {
+        "on" => args.push("--fp16".into()),
+        "off" => args.push("--no-fp16".into()),
+        _ => {}
+    }
+    args
+}
+
+static JASNA_EXE: std::sync::LazyLock<Mutex<Option<PathBuf>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// Locate jasna.exe once per session; probing costs a few seconds because the
+/// frozen Python app has to start up just to print its version.
+async fn resolve_jasna_exe(configured: &str) -> Option<PathBuf> {
+    if let Some(p) = JASNA_EXE.lock().unwrap().clone() {
+        return Some(p);
+    }
+    for candidate in jasna_candidate_paths(configured) {
+        if probe_jasna(&candidate).await.is_some() {
+            *JASNA_EXE.lock().unwrap() = Some(candidate.clone());
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// One file on the JASNA engine: a single native process, progress read with
+/// the same grammar as Lada (JASNA is a Lada fork and kept its progress line).
+async fn process_single_file_jasna(
+    app: tauri::AppHandle,
+    file_path: String,
+    index: usize,
+    total_files: usize,
+    settings: LadaSettings,
+) {
+    let input_path = PathBuf::from(&file_path);
+    let file_name = file_name_from_path(&file_path);
+    let output_dir = if settings.same_directory {
+        input_path.parent().unwrap().to_path_buf()
+    } else {
+        PathBuf::from(&settings.output_directory)
+    };
+    let stem = input_path.file_stem().unwrap().to_string_lossy();
+    let output_filename = format!("{} {}.mp4", settings.prefix, stem);
+    let output_path = output_dir.join(&output_filename);
+
+    let _ = app.emit("progress", ProgressPayload {
+        file_index: index, total_files, file_name: file_name.clone(), progress: 0.0,
+        status: "processing".to_string(), message: "Starting (JASNA)...".to_string(),
+        remaining: String::new(), speed: String::new(),
+    });
+
+    let Some(exe) = resolve_jasna_exe(&settings.jasna_path).await else {
+        let _ = app.emit("progress", ProgressPayload {
+            file_index: index, total_files, file_name: file_name.clone(), progress: 0.0,
+            status: "error".to_string(),
+            message: "jasna.exe not found — install JASNA or set its path in settings".to_string(),
+            remaining: String::new(), speed: String::new(),
+        });
+        return;
+    };
+
+    // JASNA keeps its segment scratch in --working-directory, which defaults
+    // to the output folder; point it at a fast drive with room instead.
+    let working_dir = pick_vr_work_parent(&input_path, &output_dir).join(format!("lada-jasna-tmp-{}", index));
+    let _ = std::fs::create_dir_all(&working_dir);
+
+    let args = build_jasna_args(&input_path, &output_path, &working_dir, &settings, settings.max_clip_length);
+    let ok = run_engine_pass(
+        &app, &exe.to_string_lossy(), &args, &LADA_GRAMMAR, StreamSel::Stderr, &output_path,
+        index, total_files, &file_name, "", 0.0, 100.0,
+    ).await;
+    remove_work_dir(&working_dir);
+    if !ok { return; }
+
+    let final_msg = if settings.delete_original {
+        match std::fs::remove_file(&input_path) {
+            Ok(_) => format!("Saved: {} (original deleted)", output_filename),
+            Err(e) => format!("Saved: {} (failed to delete original: {})", output_filename, e),
+        }
+    } else {
+        format!("Saved: {}", output_filename)
+    };
+    let _ = app.emit("progress", ProgressPayload {
+        file_index: index, total_files, file_name: file_name.clone(), progress: 100.0,
+        status: "done".to_string(), message: final_msg,
+        remaining: String::new(), speed: String::new(),
+    });
+    write_log(&format!("DONE(jasna) file=\"{}\" output=\"{}\"", file_name, output_filename));
+}
+
+/// Dispatch a file to whichever engine the settings name.
 async fn process_single_file(
+    app: tauri::AppHandle,
+    file_path: String,
+    index: usize,
+    total_files: usize,
+    settings: LadaSettings,
+) {
+    match engine_from(&settings.engine) {
+        Engine::Jasna => process_single_file_jasna(app, file_path, index, total_files, settings).await,
+        Engine::Lada => process_single_file_lada(app, file_path, index, total_files, settings).await,
+    }
+}
+
+async fn process_single_file_lada(
     app: tauri::AppHandle,
     file_path: String,
     index: usize,
@@ -2122,6 +2302,70 @@ mod tests {
         let ghost = std::env::temp_dir().join("lada-vr-tmp-does-not-exist-999");
         remove_work_dir(&ghost); // must not panic or log a failure for NotFound
         assert!(!ghost.exists());
+    }
+
+    /// A real progress line captured from jasna.exe 0.10.0 on stderr, in the
+    /// non-tty (piped) mode the app runs it in. JASNA kept Lada's line shape,
+    /// so the one grammar serves both engines.
+    #[test]
+    fn lada_grammar_also_parses_jasna_output() {
+        let line = "Processing video:   5%|\u{258d}         |Processed: 00:03 (128f) | Remaining: 1:08 (2576f) | Speed: 37.8fps";
+        assert_eq!(&LADA_GRAMMAR.pct.captures(line).unwrap()[1], "5");
+        assert_eq!(&LADA_GRAMMAR.remaining.as_ref().unwrap().captures(line).unwrap()[1], "1:08");
+        assert_eq!(&LADA_GRAMMAR.speed.as_ref().unwrap().captures(line).unwrap()[1], "37.8fps");
+        assert_eq!((LADA_GRAMMAR.detail)(line), "Processed: 00:03 (128f)");
+    }
+
+    #[test]
+    fn a_missing_input_file_is_fatal_regardless_of_exit_code() {
+        let tail = "  File \"C:\\jasna\\jasna\\main.py\", line 637, in main\nFileNotFoundError: C:\\x\\nope.mp4";
+        let (class, hint) = classify_exit(Some(1), tail);
+        assert!(matches!(class, ExitClass::Fatal));
+        assert!(hint.contains("not found"));
+    }
+
+    /// Golden arg vector: a flag typo should fail here, not forty minutes into
+    /// a job.
+    #[test]
+    fn jasna_args_are_exactly_what_jasna_accepts() {
+        let mut s = LadaSettings::default();
+        s.encoder = "hevc_nvenc".into();
+        s.crf = 18;
+        s.detection_model = "v4-accurate".into(); // a Lada name: must NOT be passed through
+        s.fp16 = "auto".into();
+        let args = build_jasna_args(
+            std::path::Path::new("D:/in/a.mp4"), std::path::Path::new("D:/out/[nm] a.mp4"),
+            std::path::Path::new("C:/tmp/w"), &s, 180,
+        );
+        assert_eq!(args, vec![
+            "--input", "D:/in/a.mp4",
+            "--output", "D:/out/[nm] a.mp4",
+            "--working-directory", "C:/tmp/w",
+            "--log-level", "info",
+            "--vr-mode", "auto",
+            "--max-clip-size", "180",
+            "--codec", "hevc",
+            "--cq", "18",
+        ]);
+        // Every flag must be one jasna --help actually lists.
+        let known = ["--input","--output","--working-directory","--log-level","--vr-mode",
+                     "--max-clip-size","--codec","--cq","--detection-model","--fp16","--no-fp16"];
+        for a in args.iter().filter(|a| a.starts_with("--")) {
+            assert!(known.contains(&a.as_str()), "unknown flag {a}");
+        }
+    }
+
+    #[test]
+    fn jasna_args_pass_through_only_jasna_model_names() {
+        let mut s = LadaSettings::default();
+        s.detection_model = "rfdetr-vr-v1".into();
+        s.fp16 = "off".into();
+        s.encoder = "libx264".into();
+        let args = build_jasna_args(std::path::Path::new("a"), std::path::Path::new("b"),
+                                    std::path::Path::new("c"), &s, 90);
+        assert!(args.windows(2).any(|w| w == ["--detection-model", "rfdetr-vr-v1"]));
+        assert!(args.contains(&"--no-fp16".to_string()));
+        assert!(args.windows(2).any(|w| w == ["--codec", "h264"]));
     }
 
     #[test]
