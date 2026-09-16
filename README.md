@@ -71,8 +71,10 @@ Side-by-side (SBS) VR is detected automatically — a 2:1 frame taller than 1080
 halves are a stereo pair.
 
 - **JASNA** processes the two eyes inside its own pipeline: one pass, one encode, no split/merge.
-  For VR, choose the VR-trained detector: **Detection Model → `rfdetr-vr-v1`** (JASNA's own
-  recommendation; the generic `rfdetr-v6` misses mosaics on fisheye frames).
+  The app detects VR (via the ffprobe JASNA ships) and automatically applies the combination that
+  was confirmed by eye to remove the mosaic on real fisheye content — the VR-trained detector
+  `rfdetr-vr-v1`, fisheye projection of mosaic regions, and a lower detection threshold. JASNA's
+  own auto mode (generic detector, raw projection) left the mosaic untouched on the same clip.
 - **Lada** cannot handle VR itself, so the app splits the file into left/right eyes, restores each
   at 4K, and rejoins them. That is three encode generations and, because a 4K eye needs a short clip
   window (20 frames) to fit in memory, noticeably less temporal stability. It works, but it is slow:
@@ -130,8 +132,9 @@ detection and temp-folder sweeps.
 **`JASNA not found`** — make sure every archive part was extracted, the path has only ASCII characters,
 and `jasna.exe --version` runs from a terminal. Then set the path in Settings if it is not `C:\jasna`.
 
-**Mosaic still visible on a VR file (JASNA)** — set Detection Model to `rfdetr-vr-v1`. The generic
-detector is not trained for fisheye frames.
+**Mosaic still visible on a VR file (JASNA)** — check `lada-gui.log` for a `JASNA-PROBE ... VR(SBS)` line.
+If the file was probed as 2D, its frame is not 2:1 or not taller than 1080p, which is the rule JASNA
+itself uses for side-by-side VR.
 
 **`Docker OK, GPU: not detected`** — Docker Desktop is running without GPU access; re-check step B.2
 and restart Docker Desktop.

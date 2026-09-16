@@ -1661,20 +1661,37 @@ fn build_jasna_args(
     working_dir: &std::path::Path,
     settings: &LadaSettings,
     clip_length: u32,
+    vr: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--input".into(), input.to_string_lossy().to_string(),
         "--output".into(), output.to_string_lossy().to_string(),
         "--working-directory".into(), working_dir.to_string_lossy().to_string(),
         "--log-level".into(), "info".into(),
-        "--vr-mode".into(), "auto".into(),
         "--max-clip-size".into(), clip_length.to_string(),
         "--codec".into(), jasna_codec_for(&settings.encoder).into(),
         "--cq".into(), settings.crf.clamp(1, 51).to_string(),
     ];
-    if is_jasna_detection_model(&settings.detection_model) {
-        args.push("--detection-model".into());
-        args.push(settings.detection_model.clone());
+    if vr {
+        // The combination a user confirmed by eye removes the mosaic on real
+        // fisheye SBS content, where JASNA's own auto mode (generic detector,
+        // raw projection, default threshold) left it untouched:
+        //   - the VR-trained detector,
+        //   - fisheye projection of mosaic regions before detection/restoration,
+        //   - a lower confidence threshold, since VR mosaics score low.
+        // Kept VR-only: a lowered threshold on ordinary 2D would risk false
+        // positives there.
+        args.extend([
+            "--vr-mode".into(), "sbs-fisheye".into(),
+            "--detection-model".into(), "rfdetr-vr-v1".into(),
+            "--detection-score-threshold".into(), "0.15".into(),
+        ]);
+    } else {
+        args.extend(["--vr-mode".into(), "off".into()]);
+        if is_jasna_detection_model(&settings.detection_model) {
+            args.push("--detection-model".into());
+            args.push(settings.detection_model.clone());
+        }
     }
     match settings.fp16.as_str() {
         "on" => args.push("--fp16".into()),
@@ -1682,6 +1699,34 @@ fn build_jasna_args(
         _ => {}
     }
     args
+}
+
+/// JASNA's own rule for side-by-side VR: an (almost) exact 2:1 frame taller
+/// than 1080 pixels. Applied here so the VR-specific flags can be chosen
+/// before the process is launched.
+fn is_sbs_vr_dims(width: u32, height: u32) -> bool {
+    if height <= 1080 || height == 0 { return false; }
+    let ratio = width as f64 / height as f64;
+    (1.95..=2.05).contains(&ratio)
+}
+
+/// Video dimensions via the ffprobe the JASNA package bundles in tools/, so
+/// the JASNA path needs neither Docker nor a host ffprobe.
+async fn jasna_probe_dims(jasna_exe: &std::path::Path, video: &std::path::Path) -> Option<(u32, u32)> {
+    let ffprobe = jasna_exe.parent()?.join("tools").join(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
+    if !ffprobe.exists() { return None; }
+    let mut cmd = Command::new(&ffprobe);
+    cmd.args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+              "-of", "csv=p=0:nk=1"]);
+    cmd.arg(video);
+    hide_window(&mut cmd);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() { return None; }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut it = text.trim().split(',');
+    let w = it.next()?.trim().parse().ok()?;
+    let h = it.next()?.trim().parse().ok()?;
+    Some((w, h))
 }
 
 static JASNA_EXE: std::sync::LazyLock<Mutex<Option<PathBuf>>> =
@@ -1743,7 +1788,23 @@ async fn process_single_file_jasna(
     let working_dir = pick_vr_work_parent(&input_path, &output_dir).join(format!("lada-jasna-tmp-{}", index));
     let _ = std::fs::create_dir_all(&working_dir);
 
-    let args = build_jasna_args(&input_path, &output_path, &working_dir, &settings, settings.max_clip_length);
+    let vr = match jasna_probe_dims(&exe, &input_path).await {
+        Some((w, h)) => {
+            let vr = is_sbs_vr_dims(w, h);
+            write_log(&format!("JASNA-PROBE file=\"{}\" {}x{} -> {}", file_name, w, h, if vr { "VR(SBS)" } else { "2D" }));
+            vr
+        }
+        None => false,
+    };
+    if vr {
+        let _ = app.emit("progress", ProgressPayload {
+            file_index: index, total_files, file_name: file_name.clone(), progress: 0.0,
+            status: "processing".to_string(),
+            message: "VR detected — JASNA fisheye + VR detector".to_string(),
+            remaining: String::new(), speed: String::new(),
+        });
+    }
+    let args = build_jasna_args(&input_path, &output_path, &working_dir, &settings, settings.max_clip_length, vr);
     let ok = run_engine_pass(
         &app, &exe.to_string_lossy(), &args, &LADA_GRAMMAR, StreamSel::Stderr, &output_path,
         index, total_files, &file_name, "", 0.0, 100.0,
@@ -2335,21 +2396,22 @@ mod tests {
         s.fp16 = "auto".into();
         let args = build_jasna_args(
             std::path::Path::new("D:/in/a.mp4"), std::path::Path::new("D:/out/[nm] a.mp4"),
-            std::path::Path::new("C:/tmp/w"), &s, 180,
+            std::path::Path::new("C:/tmp/w"), &s, 180, false,
         );
         assert_eq!(args, vec![
             "--input", "D:/in/a.mp4",
             "--output", "D:/out/[nm] a.mp4",
             "--working-directory", "C:/tmp/w",
             "--log-level", "info",
-            "--vr-mode", "auto",
             "--max-clip-size", "180",
             "--codec", "hevc",
             "--cq", "18",
+            "--vr-mode", "off",
         ]);
         // Every flag must be one jasna --help actually lists.
         let known = ["--input","--output","--working-directory","--log-level","--vr-mode",
-                     "--max-clip-size","--codec","--cq","--detection-model","--fp16","--no-fp16"];
+                     "--max-clip-size","--codec","--cq","--detection-model","--fp16","--no-fp16",
+                     "--detection-score-threshold"];
         for a in args.iter().filter(|a| a.starts_with("--")) {
             assert!(known.contains(&a.as_str()), "unknown flag {a}");
         }
@@ -2362,10 +2424,44 @@ mod tests {
         s.fp16 = "off".into();
         s.encoder = "libx264".into();
         let args = build_jasna_args(std::path::Path::new("a"), std::path::Path::new("b"),
-                                    std::path::Path::new("c"), &s, 90);
+                                    std::path::Path::new("c"), &s, 90, false);
         assert!(args.windows(2).any(|w| w == ["--detection-model", "rfdetr-vr-v1"]));
         assert!(args.contains(&"--no-fp16".to_string()));
         assert!(args.windows(2).any(|w| w == ["--codec", "h264"]));
+    }
+
+    /// The VR combination is the one a user confirmed by eye on real fisheye
+    /// SBS content (vr60_fish015): VR detector + fisheye projection + 0.15
+    /// threshold. Each of the three is locked in so none can silently drop.
+    #[test]
+    fn jasna_vr_jobs_get_the_proven_vr_combination() {
+        let mut s = LadaSettings::default();
+        s.detection_model = "rfdetr-v6".into(); // user's 2D choice must be overridden for VR
+        let args = build_jasna_args(std::path::Path::new("a"), std::path::Path::new("b"),
+                                    std::path::Path::new("c"), &s, 180, true);
+        assert!(args.windows(2).any(|w| w == ["--vr-mode", "sbs-fisheye"]));
+        assert!(args.windows(2).any(|w| w == ["--detection-model", "rfdetr-vr-v1"]));
+        assert!(args.windows(2).any(|w| w == ["--detection-score-threshold", "0.15"]));
+        assert!(!args.windows(2).any(|w| w == ["--detection-model", "rfdetr-v6"]));
+    }
+
+    #[test]
+    fn two_d_jobs_never_get_the_lowered_vr_threshold() {
+        let s = LadaSettings::default();
+        let args = build_jasna_args(std::path::Path::new("a"), std::path::Path::new("b"),
+                                    std::path::Path::new("c"), &s, 180, false);
+        assert!(!args.iter().any(|a| a == "--detection-score-threshold"));
+        assert!(args.windows(2).any(|w| w == ["--vr-mode", "off"]));
+    }
+
+    #[test]
+    fn sbs_vr_rule_matches_jasnas() {
+        assert!(is_sbs_vr_dims(8192, 4096), "8K SBS");
+        assert!(is_sbs_vr_dims(3840, 1920), "4K SBS");
+        assert!(!is_sbs_vr_dims(1920, 1080), "16:9 2D");
+        assert!(!is_sbs_vr_dims(2160, 1080), "2:1 but not taller than 1080 — JASNA treats it as flat");
+        assert!(!is_sbs_vr_dims(3840, 2160), "4K 16:9");
+        assert!(!is_sbs_vr_dims(0, 0));
     }
 
     #[test]
