@@ -102,7 +102,7 @@ Auto mode manages the starred rows and locks them; switch to Manual to set them 
 | Engine | Lada | `Lada` (Docker) or `JASNA` (native) |
 | JASNA Path | *(auto)* | Only needed if `jasna.exe` is not in a well-known location |
 | Settings Mode | Manual (Auto on fresh installs) | Auto derives the starred rows from detected hardware |
-| Detection Model | v4-accurate / rfdetr-v6 | Lists differ per engine. Use `rfdetr-vr-v1` for VR on JASNA |
+| Detection Model | v4-accurate / rfdetr-v6 | Lists differ per engine. VR files on JASNA switch to `rfdetr-vr-v1` automatically |
 | Restoration Model | basicvsrpp-v1.2 | Lada only |
 | FP16 ★ | auto | Half precision; on for Volta and newer |
 | Max Clip Length ★ | 180 | **Frames**, not seconds. Higher = more temporal stability and more VRAM; past ~180 it stops paying off |

@@ -97,7 +97,7 @@ Tauri + Svelte (~3MB 설치파일). 파일을 여러 개 큐에 넣고 병렬로
 | 엔진 | Lada | `Lada`(Docker) 또는 `JASNA`(네이티브) |
 | JASNA 경로 | *(자동)* | `jasna.exe`가 자동 탐색 위치에 없을 때만 |
 | 설정 방식 | 수동 (신규 설치는 자동) | 자동은 감지된 사양으로 ★ 항목을 정합니다 |
-| 감지 모델 | v4-accurate / rfdetr-v6 | 엔진별로 목록이 다릅니다. JASNA로 VR을 할 땐 `rfdetr-vr-v1` |
+| 감지 모델 | v4-accurate / rfdetr-v6 | 엔진별로 목록이 다릅니다. JASNA의 VR 파일은 자동으로 `rfdetr-vr-v1`을 씁니다 |
 | 복원 모델 | basicvsrpp-v1.2 | Lada 전용 |
 | FP16 ★ | 자동 | 반정밀도. Volta 이상은 켜짐 |
 | 최대 클립 길이 ★ | 180 | **프레임** 단위(초 아님). 클수록 안정성↑ VRAM↑, ~180 이상은 이득이 없음 |
