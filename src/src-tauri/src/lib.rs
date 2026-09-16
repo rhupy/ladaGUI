@@ -480,6 +480,12 @@ pub struct LadaSettings {
     /// exactly as the user set them. Defaults to manual so an existing install
     /// is never silently re-tuned; the frontend opts fresh installs into auto.
     settings_mode: String,
+    /// Which restoration engine to drive: "lada" (Docker) or "jasna" (native).
+    /// Stored as a string, like fp16 and settings_mode, so an unrecognised value
+    /// from a newer build degrades to the default instead of failing to load.
+    engine: String,
+    /// Optional explicit path to jasna.exe, when it is not where we look.
+    jasna_path: String,
 }
 
 /// Must stay in sync with the frontend's `$state` defaults in +page.svelte.
@@ -501,6 +507,8 @@ impl Default for LadaSettings {
             parallel_jobs: 1,
             memory_limit: 10,
             settings_mode: "manual".to_string(),
+            engine: "lada".to_string(),
+            jasna_path: String::new(),
         }
     }
 }
@@ -665,6 +673,95 @@ fn to_docker_volume_path(path: &str) -> String {
             path.to_string()
         }
     }
+}
+
+/// Which restoration engine a job runs on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Engine {
+    /// BasicVSR++ via the ladaapp/lada Docker image.
+    #[default]
+    Lada,
+    /// Native jasna.exe. Same restoration weights, its own detection models,
+    /// TensorRT pipeline, and built-in VR handling.
+    Jasna,
+}
+
+/// Parse defensively: anything unrecognised falls back to the default engine
+/// rather than failing, so a settings file from a newer build still loads.
+fn engine_from(s: &str) -> Engine {
+    if s.eq_ignore_ascii_case("jasna") { Engine::Jasna } else { Engine::Lada }
+}
+
+/// A located JASNA installation.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct JasnaInfo {
+    path: String,
+    version: String,
+    ok: bool,
+}
+
+/// Where to look for jasna.exe, in priority order. JASNA is never bundled or
+/// downloaded by this app — it is AGPL software the user installs themselves,
+/// and we only detect and invoke it, exactly as we invoke the Lada image.
+fn jasna_candidate_paths(configured: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if !configured.trim().is_empty() {
+        out.push(PathBuf::from(configured.trim()));
+    }
+    if cfg!(windows) {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            out.push(PathBuf::from(local).join("Programs").join("jasna").join("jasna.exe"));
+        }
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            out.push(PathBuf::from(home).join("jasna").join("jasna.exe"));
+        }
+        out.push(PathBuf::from(r"C:\jasna\jasna.exe"));
+        out.push(PathBuf::from("jasna.exe")); // whatever is on PATH
+    } else {
+        // Development on WSL, where the Windows install is visible under /mnt.
+        out.push(PathBuf::from("/mnt/c/jasna/jasna.exe"));
+        out.push(PathBuf::from("jasna"));
+    }
+    out
+}
+
+/// Ask a candidate binary for its version; that it answers at all is what
+/// proves the install is usable.
+async fn probe_jasna(exe: &std::path::Path) -> Option<JasnaInfo> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("--version");
+    hide_window(&mut cmd);
+    let out = cmd.output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let version = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some(JasnaInfo {
+        path: exe.to_string_lossy().to_string(),
+        version,
+        ok: true,
+    })
+}
+
+#[tauri::command]
+async fn detect_jasna(configured_path: String) -> Result<JasnaInfo, String> {
+    for candidate in jasna_candidate_paths(&configured_path) {
+        if let Some(info) = probe_jasna(&candidate).await {
+            write_log(&format!("JASNA-DETECT found \"{}\" version=\"{}\"", info.path, info.version));
+            return Ok(info);
+        }
+    }
+    Err("jasna.exe not found — install it and set its path in settings".to_string())
 }
 
 /// Build the `docker run ... ladaapp/lada` argument vector for one Lada job.
@@ -1307,6 +1404,40 @@ fn vr_pass_memory_gb(configured: u32) -> u32 {
     if configured == 0 { 0 } else { configured.max(VR_MIN_MEMORY_GB) }
 }
 
+/// Remove a work dir, retrying briefly: the encoder that just wrote into it
+/// can still be releasing handles when the job finishes. A failure is logged
+/// rather than swallowed, so leftover gigabytes are at least explained.
+fn remove_work_dir(path: &std::path::Path) {
+    for attempt in 1..=3 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                if attempt == 3 {
+                    write_log(&format!("CLEANUP-FAIL dir=\"{}\" error: {}", path.display(), e));
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            }
+        }
+    }
+}
+
+/// Delete VR work dirs a previous run left behind — a crash, a killed app, or
+/// a drive that vanished mid-job all skip the normal cleanup. Only our own
+/// naming patterns are touched, so nothing of the user's is ever at risk.
+fn sweep_stale_vr_dirs(parent: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let ours = name.starts_with("lada-vr-tmp-") || name.starts_with(".lada_vr_tmp_");
+        if ours && entry.path().is_dir() {
+            write_log(&format!("SWEEP stale VR work dir \"{}\"", entry.path().display()));
+            remove_work_dir(&entry.path());
+        }
+    }
+}
+
 /// VR (side-by-side) pipeline: stage the source onto the work drive → split L/R
 /// → Lada each half → hstack + audio → stage the result back out.
 ///
@@ -1329,7 +1460,13 @@ async fn process_vr_file(
     // An 8K VR job's staged source plus four halves total tens of GB, so place
     // them on whichever drive can take it: fast system temp when it has room,
     // else the output drive.
-    let work_dir = pick_vr_work_parent(input_path, output_dir).join(format!("lada-vr-tmp-{}", index));
+    let work_parent = pick_vr_work_parent(input_path, output_dir);
+    // Sweep debris first: an older run may have died before it could clean up,
+    // in either place a work dir can live.
+    sweep_stale_vr_dirs(&std::env::temp_dir());
+    if work_parent != std::env::temp_dir() { sweep_stale_vr_dirs(&work_parent); }
+    sweep_stale_vr_dirs(output_dir);
+    let work_dir = work_parent.join(format!("lada-vr-tmp-{}", index));
     let _ = std::fs::create_dir_all(&work_dir);
     let work_dir_docker = to_docker_volume_path(work_dir.to_str().unwrap());
     if !cfg!(windows) {
@@ -1346,7 +1483,7 @@ async fn process_vr_file(
     let left_out = work_dir.join("vr_left_out.mp4");
     let right_out = work_dir.join("vr_right_out.mp4");
     let merged = work_dir.join("vr_merged.mp4");
-    let cleanup = || { let _ = std::fs::remove_dir_all(&work_dir); };
+    let cleanup = || remove_work_dir(&work_dir);
 
     let fail = |stage: &str, e: String| {
         write_log(&format!("VR-{}-FAIL file=\"{}\" error: {}", stage, file_name, e));
@@ -1666,6 +1803,7 @@ pub fn run() {
             get_system_stats,
             detect_hardware,
             recommend_settings,
+            detect_jasna,
             shutdown_pc,
         ])
         .setup(|app| {
@@ -1933,6 +2071,57 @@ mod tests {
         let per_pass = vr_pass_memory_gb(d.memory_limit) as u64 * 1024;
         assert!(per_pass * d.parallel_jobs as u64 <= p.docker_ram_limit_mb,
             "{} VR jobs at {}MB each must fit in {}MB", d.parallel_jobs, per_pass, p.docker_ram_limit_mb);
+    }
+
+    #[test]
+    fn engine_parsing_never_fails_on_unknown_values() {
+        assert_eq!(engine_from("jasna"), Engine::Jasna);
+        assert_eq!(engine_from("JASNA"), Engine::Jasna);
+        assert_eq!(engine_from("lada"), Engine::Lada);
+        // A value written by some future build must degrade, not explode.
+        assert_eq!(engine_from("seedvr"), Engine::Lada);
+        assert_eq!(engine_from(""), Engine::Lada);
+        assert_eq!(Engine::default(), Engine::Lada, "Lada stays the default engine");
+    }
+
+    #[test]
+    fn a_configured_jasna_path_is_tried_first() {
+        let paths = jasna_candidate_paths("D:/tools/jasna/jasna.exe");
+        assert_eq!(paths[0].to_string_lossy(), "D:/tools/jasna/jasna.exe");
+        assert!(paths.len() > 1, "well-known locations are still searched after it");
+    }
+
+    #[test]
+    fn a_blank_configured_path_is_skipped_not_probed() {
+        let paths = jasna_candidate_paths("   ");
+        assert!(!paths.is_empty());
+        assert!(!paths[0].to_string_lossy().trim().is_empty(),
+            "an empty setting must not become an empty candidate path");
+    }
+
+    #[test]
+    fn sweep_removes_only_our_own_work_dirs() {
+        let root = std::env::temp_dir().join(format!("lada-sweep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lada-vr-tmp-3")).unwrap();
+        std::fs::create_dir_all(root.join(".lada_vr_tmp_0")).unwrap();
+        std::fs::create_dir_all(root.join("users-own-folder")).unwrap();
+        std::fs::write(root.join("lada-vr-tmp-3").join("vr_left.mp4"), b"x").unwrap();
+        std::fs::write(root.join("users-own-folder").join("keep.mp4"), b"x").unwrap();
+
+        sweep_stale_vr_dirs(&root);
+
+        assert!(!root.join("lada-vr-tmp-3").exists(), "current naming is swept");
+        assert!(!root.join(".lada_vr_tmp_0").exists(), "the older dot-prefixed naming is swept too");
+        assert!(root.join("users-own-folder").join("keep.mp4").exists(), "anything else is untouched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_a_missing_dir_is_not_an_error() {
+        let ghost = std::env::temp_dir().join("lada-vr-tmp-does-not-exist-999");
+        remove_work_dir(&ghost); // must not panic or log a failure for NotFound
+        assert!(!ghost.exists());
     }
 
     #[test]
