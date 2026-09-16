@@ -68,12 +68,20 @@
   let detecting = $state(false);
   // "auto": derive_settings owns the tuned fields. "manual": the user does.
   let settingsMode = $state("manual");
+  // Restoration engine: "lada" (Docker) or "jasna" (native jasna.exe).
+  let engine = $state("lada");
+  let jasnaPath = $state("");
+  /** @type {any} */
+  let jasnaInfo = $state(null);
+  let detectingJasna = $state(false);
 
   let perfData = $state({ cpuUsage: 0, ramUsed: 0, ramTotal: 0, ramPercent: 0, gpuUsage: 0, vramUsage: 0, vramTotal: 0, gpuTemp: 0, gpuPower: 0 });
   let perfInterval = null;
 
   // Rows that auto mode manages are locked while it is on.
   const settingsLocked = $derived(processing || settingsMode === "auto");
+  // A JASNA user need not have Docker at all, so readiness follows the engine.
+  const engineReady = $derived(engine === "lada" ? dockerOk : !!jasnaInfo?.ok);
 
   const VIDEO_EXTENSIONS = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts"];
 
@@ -113,6 +121,12 @@
     settingsModeLabel: lang === "ko" ? "설정 방식" : "Settings Mode",
     modeAuto: lang === "ko" ? "자동" : "Auto",
     modeManual: lang === "ko" ? "수동" : "Manual",
+    engineLabel: lang === "ko" ? "엔진" : "Engine",
+    jasnaPathLabel: lang === "ko" ? "JASNA 경로" : "JASNA Path",
+    jasnaPathHint: lang === "ko" ? "비워두면 자동 탐색 (C:\\jasna 등)" : "Leave empty to auto-detect (C:\\jasna etc.)",
+    jasnaDetecting: lang === "ko" ? "JASNA 찾는 중..." : "Looking for JASNA...",
+    jasnaNotFound: lang === "ko" ? "JASNA를 찾지 못했습니다" : "JASNA not found",
+    pauseUnavailable: lang === "ko" ? "JASNA 엔진은 일시정지를 지원하지 않습니다" : "Pause is not available on the JASNA engine",
     updateAvailable: lang === "ko" ? "새 버전이 있습니다" : "Update available",
     updateNow: lang === "ko" ? "지금 업데이트" : "Update now",
     updateDownloading: lang === "ko" ? "내려받는 중" : "Downloading",
@@ -153,6 +167,9 @@
     maxClipLength: lang === "ko"
       ? "복원 단위 클립의 최대 프레임 수 (초 아님)\n클수록 시간적 안정성↑, VRAM 사용량↑\n180을 넘으면 속도 이득은 거의 없고 VRAM만 늘어남\n너무 작으면 오히려 느려짐\nVRAM 부족 시 낮추세요"
       : "Max frames per restoration clip (frames, not seconds)\nHigher = better temporal stability, more VRAM\nPast ~180 speed plateaus while VRAM keeps growing\nToo low is slower, not faster\nLower if running out of VRAM",
+    engine: lang === "ko"
+      ? "Lada: Docker 이미지로 실행 (기본)\nJASNA: 네이티브 실행파일. 같은 복원 모델에 TensorRT로 더 빠르고, VR을 내부에서 눈별로 처리\n\nJASNA는 직접 설치해야 합니다 (앱이 받아주지 않음)"
+      : "Lada: runs the Docker image (default)\nJASNA: native executable. Same restoration model, faster via TensorRT, handles VR per-eye internally\n\nJASNA must be installed by you (the app never downloads it)",
     settingsMode: lang === "ko"
       ? "자동: 감지된 사양에 맞춰 병렬 수·클립 길이·메모리·FP16·인코더를 계산해 적용합니다\n수동: 직접 지정한 값을 그대로 사용합니다\n\n자동이 관리하는 항목은 잠깁니다"
       : "Auto: computes parallel jobs, clip length, memory, FP16 and encoder from the detected hardware\nManual: uses exactly what you set\n\nFields auto manages are locked",
@@ -176,6 +193,14 @@
       : "Add semi-transparent watermark text to output",
   });
 
+  // Declared after `t`, which it reads.
+  const engineStatus = $derived(
+    engine === "lada" ? dockerStatus
+    : jasnaInfo?.ok ? `JASNA ${jasnaInfo.version} ready`
+    : detectingJasna ? t.jasnaDetecting
+    : t.jasnaNotFound
+  );
+
   function getSettingsObj() {
     return {
       detection_model: detectionModel,
@@ -192,6 +217,8 @@
       shutdown_after: shutdownAfter,
       parallel_jobs: parallelJobs,
       settings_mode: settingsMode,
+      engine,
+      jasna_path: jasnaPath,
       memory_limit: memoryLimit,
     };
   }
@@ -256,6 +283,8 @@
         shutdownAfter = saved.shutdown_after ?? shutdownAfter;
         parallelJobs = saved.parallel_jobs ?? parallelJobs;
         settingsMode = saved.settings_mode ?? settingsMode;
+        engine = saved.engine ?? engine;
+        jasnaPath = saved.jasna_path ?? jasnaPath;
         memoryLimit = saved.memory_limit ?? memoryLimit;
       }
     } catch (e) {
@@ -265,6 +294,7 @@
     // Only now is settingsMode known, so a derived recommendation can be
     // applied (or not) according to the mode the user actually has.
     detectHardware();
+    if (engine === "jasna") detectJasna();
     checkForAppUpdate();
 
     // Load saved language
@@ -568,6 +598,31 @@
     persistSettings();
   }
 
+  async function detectJasna() {
+    detectingJasna = true;
+    try {
+      jasnaInfo = await invoke("detect_jasna", { configuredPath: jasnaPath });
+    } catch (e) {
+      jasnaInfo = null;
+    } finally {
+      detectingJasna = false;
+    }
+  }
+
+  const LADA_DETECTION_MODELS = ["v4-fast", "v4-accurate"];
+  const JASNA_DETECTION_MODELS = ["rfdetr-v6", "rfdetr-v6-large", "rfdetr-vr-v1"];
+
+  /** @param {string} next */
+  function setEngine(next) {
+    engine = next;
+    // The detection model list differs per engine; a name from the other
+    // engine would make it fail to start, so fall back to that engine's default.
+    if (next === "jasna" && !JASNA_DETECTION_MODELS.includes(detectionModel)) detectionModel = "rfdetr-v6";
+    if (next === "lada" && !LADA_DETECTION_MODELS.includes(detectionModel)) detectionModel = "v4-accurate";
+    persistSettings();
+    if (next === "jasna") detectJasna();
+  }
+
   /** @param {string} mode */
   function setSettingsMode(mode) {
     settingsMode = mode;
@@ -652,8 +707,8 @@
         <button class="lang-btn" class:active={lang === "en"} onclick={() => setLang("en")}>EN</button>
         <button class="lang-btn" class:active={lang === "ko"} onclick={() => setLang("ko")}>KO</button>
       </div>
-      <div class="status" class:ok={dockerOk} class:err={!dockerOk}>
-        {dockerStatus}
+      <div class="status" class:ok={engineReady} class:err={!engineReady}>
+        {engineStatus}
       </div>
     </div>
   </header>
@@ -667,7 +722,7 @@
       {#if processing}
         <span class="update-busy">{t.updateBusy}</span>
       {:else}
-        <button class="update-btn" onclick={installAppUpdate} disabled={appUpdating}>
+        <button class="app-update-btn" onclick={installAppUpdate} disabled={appUpdating}>
           {appUpdating ? `${updateProgress}%` : t.updateNow}
         </button>
       {/if}
@@ -692,7 +747,7 @@
       {/if}
     </button>
     <div class="spacer"></div>
-    <button class="update-btn" onclick={updateLada} disabled={updating || processing}>
+    <button class="update-btn" onclick={updateLada} disabled={updating || processing} hidden={engine === "jasna"}>
       {updating ? t.updating : t.updateLada}
     </button>
   </div>
@@ -743,6 +798,25 @@
       </div>
 
       <div class="setting-row">
+        <label>{t.engineLabel}</label>
+        <div class="mode-toggle">
+          <button class:active={engine === "lada"} onclick={() => setEngine("lada")} disabled={processing}>Lada</button>
+          <button class:active={engine === "jasna"} onclick={() => setEngine("jasna")} disabled={processing}>JASNA</button>
+        </div>
+        <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.engine}</span></span>
+      </div>
+      {#if engine === "jasna"}
+        <div class="setting-row sub-setting">
+          <label>{t.jasnaPathLabel}</label>
+          <input type="text" bind:value={jasnaPath} placeholder={t.jasnaPathHint} disabled={processing}
+            onchange={() => { persistSettings(); detectJasna(); }} />
+          <span class="jasna-status" class:ok={jasnaInfo?.ok} class:err={!jasnaInfo?.ok && !detectingJasna}>
+            {jasnaInfo?.ok ? `✓ ${jasnaInfo.version} · ${jasnaInfo.path}` : detectingJasna ? t.jasnaDetecting : t.jasnaNotFound}
+          </span>
+        </div>
+      {/if}
+
+      <div class="setting-row">
         <label>{t.settingsModeLabel}</label>
         <div class="mode-toggle">
           <button class:active={settingsMode === "auto"} onclick={() => setSettingsMode("auto")} disabled={processing}>{t.modeAuto}</button>
@@ -764,11 +838,18 @@
       <div class="setting-row">
         <label>{t.detectionModel}</label>
         <select bind:value={detectionModel} disabled={processing} onchange={persistSettings}>
-          <option value="v4-fast">v4-fast</option>
-          <option value="v4-accurate">v4-accurate</option>
+          {#if engine === "jasna"}
+            <option value="rfdetr-v6">rfdetr-v6 ({lang === "ko" ? "기본" : "default"})</option>
+            <option value="rfdetr-v6-large">rfdetr-v6-large</option>
+            <option value="rfdetr-vr-v1">rfdetr-vr-v1 (VR)</option>
+          {:else}
+            <option value="v4-fast">v4-fast</option>
+            <option value="v4-accurate">v4-accurate</option>
+          {/if}
         </select>
         <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.detectionModel}</span></span>
       </div>
+      {#if engine === "lada"}
       <div class="setting-row">
         <label>{t.restorationModel}</label>
         <select bind:value={restorationModel} disabled={processing} onchange={persistSettings}>
@@ -778,6 +859,7 @@
         </select>
         <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.restorationModel}</span></span>
       </div>
+      {/if}
       <div class="setting-row">
         <label>{t.fp16Label}</label>
         <select bind:value={fp16} disabled={settingsLocked} onchange={persistSettings}>
@@ -814,6 +896,7 @@
         </div>
         <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.parallelJobs}</span></span>
       </div>
+      {#if engine === "lada"}
       <div class="setting-row">
         <label>{t.memoryLimitLabel}</label>
         <div class="number-spinner">
@@ -837,6 +920,7 @@
         <span class="mem-unit">GB</span>
         <span class="tooltip-wrap"><span class="tooltip-icon">?</span><span class="tooltip-text">{tooltips.memoryLimit}</span></span>
       </div>
+      {/if}
       <div class="setting-row">
         <label>{t.encoderLabel}</label>
         <select bind:value={encoder} disabled={settingsLocked} onchange={persistSettings}>
@@ -1047,7 +1131,8 @@
   <footer>
     {#if processing}
       <div class="footer-buttons">
-        <button class="pause-btn" onclick={togglePause}>
+        <button class="pause-btn" onclick={togglePause} disabled={engine === "jasna"}
+          title={engine === "jasna" ? t.pauseUnavailable : ""}>
           {paused ? t.resume : t.pause}
         </button>
         <button class="cancel-btn" onclick={cancelProcessing}>{t.cancel}</button>
@@ -1056,7 +1141,7 @@
       <button
         class="start-btn"
         onclick={startProcessing}
-        disabled={files.length === 0 || !dockerOk}
+        disabled={files.length === 0 || !engineReady}
       >
         {t.startProcessing} ({files.filter((f) => f.status === "pending" || f.status === "error" || f.status === "cancelled").length} {t.files})
       </button>
@@ -1459,7 +1544,7 @@
   }
   .update-text { font-size: 12px; color: #cfe2f3; flex: 1; }
   .update-busy { font-size: 11px; color: #f0c674; }
-  .update-btn {
+  .app-update-btn {
     background: #3a6ea5;
     color: #fff;
     border: none;
@@ -1468,8 +1553,18 @@
     font-size: 12px;
     cursor: pointer;
   }
-  .update-btn:hover:not(:disabled) { background: #4a7eb5; }
-  .update-btn:disabled { opacity: 0.6; cursor: default; }
+  .app-update-btn:hover:not(:disabled) { background: #4a7eb5; }
+  .app-update-btn:disabled { opacity: 0.6; cursor: default; }
+  .jasna-status {
+    font-size: 11px;
+    margin-left: 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 320px;
+  }
+  .jasna-status.ok { color: #7ecf8a; }
+  .jasna-status.err { color: #f4978e; }
   .update-dismiss {
     background: transparent;
     color: #8a9aa8;
