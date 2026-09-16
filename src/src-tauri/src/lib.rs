@@ -1673,18 +1673,16 @@ fn build_jasna_args(
         "--cq".into(), settings.crf.clamp(1, 51).to_string(),
     ];
     if vr {
-        // The combination a user confirmed by eye removes the mosaic on real
-        // fisheye SBS content, where JASNA's own auto mode (generic detector,
-        // raw projection, default threshold) left it untouched:
-        //   - the VR-trained detector,
-        //   - fisheye projection of mosaic regions before detection/restoration,
-        //   - a lower confidence threshold, since VR mosaics score low.
-        // Kept VR-only: a lowered threshold on ordinary 2D would risk false
-        // positives there.
+        // Confirmed by eye on real fisheye SBS content, one lever at a time:
+        // JASNA's auto mode resolves an unregistered studio to projection=raw,
+        // and on raw frames neither detector found the mosaic. Fisheye
+        // projection of the mosaic regions alone removed it; lowering the
+        // detection threshold alone did not, so the threshold is left at its
+        // default and no false-positive risk is taken on. The VR-trained
+        // detector is JASNA's own recommendation for this content.
         args.extend([
             "--vr-mode".into(), "sbs-fisheye".into(),
             "--detection-model".into(), "rfdetr-vr-v1".into(),
-            "--detection-score-threshold".into(), "0.15".into(),
         ]);
     } else {
         args.extend(["--vr-mode".into(), "off".into()]);
@@ -2430,23 +2428,25 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--codec", "h264"]));
     }
 
-    /// The VR combination is the one a user confirmed by eye on real fisheye
-    /// SBS content (vr60_fish015): VR detector + fisheye projection + 0.15
-    /// threshold. Each of the three is locked in so none can silently drop.
+    /// Confirmed by eye on real fisheye SBS content, one lever at a time:
+    /// fisheye projection alone removed the mosaic (vr60_fisheye), a lowered
+    /// threshold alone did not (vr60_thr015). So VR gets fisheye + the VR
+    /// detector, and never a lowered threshold.
     #[test]
-    fn jasna_vr_jobs_get_the_proven_vr_combination() {
+    fn jasna_vr_jobs_get_fisheye_and_the_vr_detector_only() {
         let mut s = LadaSettings::default();
         s.detection_model = "rfdetr-v6".into(); // user's 2D choice must be overridden for VR
         let args = build_jasna_args(std::path::Path::new("a"), std::path::Path::new("b"),
                                     std::path::Path::new("c"), &s, 180, true);
         assert!(args.windows(2).any(|w| w == ["--vr-mode", "sbs-fisheye"]));
         assert!(args.windows(2).any(|w| w == ["--detection-model", "rfdetr-vr-v1"]));
-        assert!(args.windows(2).any(|w| w == ["--detection-score-threshold", "0.15"]));
+        assert!(!args.iter().any(|a| a == "--detection-score-threshold"),
+            "the threshold was shown not to matter; leave JASNA's default");
         assert!(!args.windows(2).any(|w| w == ["--detection-model", "rfdetr-v6"]));
     }
 
     #[test]
-    fn two_d_jobs_never_get_the_lowered_vr_threshold() {
+    fn two_d_jobs_are_flat_with_the_configured_detector() {
         let s = LadaSettings::default();
         let args = build_jasna_args(std::path::Path::new("a"), std::path::Path::new("b"),
                                     std::path::Path::new("c"), &s, 180, false);

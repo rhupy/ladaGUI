@@ -72,9 +72,9 @@ halves are a stereo pair.
 
 - **JASNA** processes the two eyes inside its own pipeline: one pass, one encode, no split/merge.
   The app detects VR (via the ffprobe JASNA ships) and automatically applies the combination that
-  was confirmed by eye to remove the mosaic on real fisheye content — the VR-trained detector
-  `rfdetr-vr-v1`, fisheye projection of mosaic regions, and a lower detection threshold. JASNA's
-  own auto mode (generic detector, raw projection) left the mosaic untouched on the same clip.
+  was confirmed by eye to remove the mosaic on real fisheye content — fisheye projection of
+  the mosaic regions plus the VR-trained detector `rfdetr-vr-v1`. JASNA's own auto mode resolves an
+  unregistered studio to raw projection, and on raw frames the mosaic went undetected on the same clip.
 - **Lada** cannot handle VR itself, so the app splits the file into left/right eyes, restores each
   at 4K, and rejoins them. That is three encode generations and, because a 4K eye needs a short clip
   window (20 frames) to fit in memory, noticeably less temporal stability. It works, but it is slow:
