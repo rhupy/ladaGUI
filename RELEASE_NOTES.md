@@ -1,44 +1,45 @@
-## Lada GUI v0.7.0
+## Lada GUI v0.8.0
 
-사양을 감지해 **설정을 자동으로 맞춰주고**, 앱 안에서 **새 버전으로 바로 업데이트**할 수 있게 되었습니다.
-This release tunes itself to your hardware and can update itself in place.
+**JASNA 엔진**을 선택할 수 있습니다. 같은 복원 모델로 훨씬 빠르고, VR을 내부에서 눈별로 처리합니다.
+Adds the **JASNA engine** as a selectable option — same restoration model, much faster, with VR handled per-eye internally.
 
-### ✨ 새로운 기능 / New features
+### ✨ 새로운 기능 / New feature
 
-- **사양 자동 감지 + 자동 설정 / Hardware detection and auto settings**
-  - GPU·VRAM·CPU 코어·RAM·Docker 메모리 상한·임시폴더 여유를 감지해, **병렬 작업 수 / 클립 길이 / 컨테이너 메모리 / FP16 / 인코더**를 계산해 적용합니다. 설정에서 `자동 ↔ 수동`을 고를 수 있습니다.
-  - Detects GPU/VRAM, CPU cores, RAM, Docker's memory ceiling and free temp space, then sets parallel jobs, clip length, container memory, FP16 and encoder. Switch between `Auto` and `Manual` in settings.
-  - **숫자만 보여주지 않고 근거를 함께 표시합니다** — 예: `4 concurrent jobs — limited by CPU cores (VRAM allows 8, CPU 4, Docker RAM 4)`.
-  - It shows *why*, not just *what* — e.g. `4 concurrent jobs — limited by CPU cores (VRAM allows 8, CPU 4, Docker RAM 4)`.
-  - 추천값은 추측이 아니라 **실측 기반**입니다. RTX 5090에서 클립 길이별 VRAM/처리시간을 직접 측정해 표로 넣었습니다.
-  - The recommendations come from measurements, not guesses: VRAM and processing time were measured per clip length on an RTX 5090.
-  - ⚠️ **기존 사용자의 설정은 그대로 유지됩니다.** 직접 맞춰둔 값을 덮어쓰지 않도록, 자동 모드는 신규 설치에서만 기본으로 켜집니다. 원하면 설정에서 켜세요.
-  - Existing installs keep their settings — auto mode is only the default on a fresh install, so hand-tuned values are never overwritten. Turn it on in settings if you want it.
-- **앱 내 자동 업데이트 / In-app auto-update**
-  - 새 버전이 나오면 상단에 배너가 뜨고, 클릭 한 번으로 내려받아 설치·재시작합니다. 모든 업데이트는 서명으로 검증됩니다.
-  - A banner appears when a new version is out; one click downloads, verifies and installs it. Every update is signature-verified.
-  - **작업 중에는 업데이트할 수 없습니다** — Windows는 설치 과정에서 앱을 종료시키므로, 진행 중인 작업이 사라지지 않도록 막아둡니다.
-  - Updates are blocked while jobs are running: Windows exits the app to install, which would kill work in progress.
+- **엔진 선택: Lada / JASNA** — 설정 패널 맨 위에서 고릅니다. Lada가 기본이며 기존 동작은 그대로입니다.
+- **Engine selector: Lada / JASNA** — top of the settings panel. Lada stays the default; nothing changes unless you switch.
+- 이 PC(RTX 5090)에서 **같은 파일로 실측**한 결과 / Measured on this machine (RTX 5090), identical files:
+  - 1080p 파일당: Lada 92초 → **JASNA 35초 (2.6배)** / per file: 92s → **35s (2.6x)**
+  - 동시 3개 실행: 처리량 **2.06배** 추가 / 3 concurrent jobs: **2.06x** more throughput on top
+  - 60초 8K VR: **107초** (Lada 경로 대비 대략 18배) / 60s of 8K VR: **107s** (roughly 18x the Lada path)
+- JASNA는 VR을 **파이프라인 안에서 눈별로 처리**하므로 좌우 분리·재합성이 없습니다. 재인코딩이 3회에서 1회로 줄어 화질 손실도 줄고, 4K 메모리 때문에 강제됐던 짧은 클립(20) 제한도 사라집니다.
+- JASNA handles VR **per-eye inside its own pipeline** — no split/merge. Encode generations drop from 3 to 1, and the short clip window (20) forced by 4K memory limits no longer applies.
+- **병렬 처리는 JASNA 자체 GUI에는 없는 기능**입니다. JASNA 하나로는 GPU를 다 쓰지 못하므로, 여러 파일을 동시에 돌리면 처리량이 실제로 늘어납니다.
+- **Parallel processing is something JASNA's own GUI cannot do.** A single JASNA process does not saturate the GPU, so running several files at once genuinely raises throughput.
 
-### 🐞 버그 수정 / Bug fixes
+### 📦 JASNA 설치 (직접 해야 합니다) / Installing JASNA (you do this yourself)
 
-- **무한 재시도 중단 / Retries are now bounded**
-  - 외장하드가 빠지는 등으로 실패하면 30초마다 **영원히 재시도**하며 작업이 끝나지 않던 문제를 고쳤습니다. 이제 복구 불가능한 원인(드라이브 유실 등)은 즉시 실패로 처리하고, 그 외에는 최대 10회까지만 간격을 늘려가며 재시도한 뒤 정리합니다.
-  - A failure used to retry every 30s forever — a disconnected drive left a job spinning indefinitely. Unrecoverable causes now fail immediately, and anything else retries at most 10 times with growing backoff.
-  - 포기한 작업이 "처리 중"에 멈춰 있지 않고 **실패로 명확히 표시**됩니다.
-  - A job that gives up is now clearly marked failed instead of sitting on "processing".
-- **VR 동시 처리 시 메모리 초과 / VR jobs could overcommit memory**
-  - VR 작업이 메모리 무제한으로 실행되어, 병렬 작업 수가 2 이상이면 4K 컨테이너 여러 개가 상한 없이 경쟁할 수 있었습니다. 이제 각 패스가 적정 한도를 받습니다.
-  - VR passes ran without a memory limit, so with parallel jobs above 1 several 4K containers could compete unbounded. Each pass now gets a proper limit.
-- 최대 클립 길이 툴팁이 단위를 "초"라고 잘못 안내하던 것을 **"프레임"**으로 수정했습니다.
-- Fixed the max clip length tooltip, which described the unit as seconds when it is frames.
+이 앱은 JASNA를 **내려받거나 번들하지 않습니다** — 설치된 것을 찾아 실행만 합니다. (AGPL, Lada와 동일)
+This app **never downloads or bundles JASNA** — it only detects and runs an existing install. (AGPL, same as Lada.)
+
+1. https://github.com/Kruk2/jasna/releases 에서 Windows(NVIDIA) 패키지의 **모든 파트**(`.7z.001/.002/.003`)를 받아 압축 해제 / download **every part** of the Windows (NVIDIA) package and extract
+2. **영문·숫자만 있는 경로**에 설치 — 예: `C:\jasna` (자동 탐색 위치) / install under an **ASCII-only path**, e.g. `C:\jasna` (auto-detected)
+3. 첫 실행 시 TensorRT 엔진을 빌드합니다 (이 PC에서 약 3분, 최초 1회) / first run builds TensorRT engines (about 3 minutes here, once)
+4. 요구사항: RTX 20 시리즈 이상, Windows 드라이버 610+ / requires RTX 20-series or newer, Windows driver 610+
+
+다른 경로에 설치했다면 설정의 **JASNA 경로**에 `jasna.exe` 위치를 적으세요. / If installed elsewhere, set the `jasna.exe` location in **JASNA Path**.
+
+### 🛠 그 외 / Also
+
+- 크래시나 드라이브 끊김으로 남은 VR 임시 폴더(`lada-vr-tmp-*`, 옛 `.lada_vr_tmp_*`)를 다음 작업 시작 때 **자동으로 정리**하고, 정리 실패는 로그에 남깁니다.
+- VR temp folders left behind by a crash or a dropped drive are now **swept automatically** at the next job, and a cleanup failure is logged instead of ignored.
+- 업데이트 배너 버튼이 "Lada 업데이트" 버튼의 스타일을 덮어쓰던 문제를 고쳤습니다. / Fixed the update banner restyling the "Update Lada" button.
+- JASNA 엔진에서는 **일시정지**를 지원하지 않습니다(네이티브 CUDA 프로세스를 안전하게 멈출 수 없어 버튼을 비활성화). 취소는 정상 동작합니다.
+- **Pause is unavailable on JASNA** (a native CUDA process cannot be suspended safely, so the button is disabled). Cancel works.
 
 ### ℹ️ 참고 / Notes
 
-- **이번 버전은 수동으로 설치해야 합니다.** v0.6.0에는 업데이트 기능이 없어 자동으로 받을 수 없습니다. v0.7.0부터는 앱 안에서 업데이트됩니다.
-- **This one must be installed by hand.** v0.6.0 has no updater, so it cannot fetch this automatically. From v0.7.0 onward updates happen in-app.
-- 설정을 자동으로 바꾸고 싶다면 설정 패널에서 `설정 방식`을 **자동**으로 바꾸세요.
-- To let the app tune itself, set `Settings Mode` to **Auto** in the settings panel.
+- v0.7.0 이상에서는 앱 안의 배너로 이 업데이트를 받을 수 있습니다. / From v0.7.0 this update arrives through the in-app banner.
+- 2D 작업에는 Lada 품질이 충분하다면 그대로 두어도 됩니다. 엔진은 언제든 바꿀 수 있습니다. / If Lada's 2D quality suits you, leave it. The engine can be switched at any time.
 
 ---
 

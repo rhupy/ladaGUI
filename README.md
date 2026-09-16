@@ -60,6 +60,23 @@ GPU access in Docker requires additional configuration.
    ```
    If missing, install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
+
+### 4. JASNA engine (optional, faster)
+
+Since v0.8.0 the app can drive [JASNA](https://github.com/Kruk2/jasna) instead of Lada. It uses the same
+restoration model but is several times faster (measured 2.6x per file on an RTX 5090, plus ~2x more
+throughput when running files in parallel) and handles VR per-eye internally with no split/merge.
+
+The app **never downloads or bundles JASNA** — it only detects and runs an install you made yourself:
+
+1. Download **every part** of the Windows (NVIDIA) package from the JASNA releases page and extract it.
+2. Install under an **ASCII-only path** such as `C:\jasna` (auto-detected). Other locations can be set in
+   Settings → JASNA Path.
+3. The first run builds TensorRT engines (a few minutes, once).
+4. Requires an RTX 20-series or newer GPU and Windows driver 610+.
+
+Docker is not needed while the JASNA engine is selected. Pause is unavailable on JASNA (cancel works).
+
 ### 4. Pull Lada Docker Image
 
 Pre-download the Lada image (~14GB):
