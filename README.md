@@ -2,9 +2,13 @@
 
 **[한국어](README.ko.md)** | English | [![Discord](https://img.shields.io/badge/Discord-Join-7289da?logo=discord&logoColor=white)](https://discord.gg/px4vBjTUBg)
 
-A lightweight GUI wrapper for [Lada](https://github.com/ladaapp/lada), an AI-based video mosaic removal tool.
+A lightweight batch front-end for AI video mosaic removal. It drives either
+[Lada](https://github.com/ladaapp/lada) (via Docker) or [JASNA](https://github.com/Kruk2/jasna)
+(native, faster) — the engine is a setting, and the app is built so that better engines can be
+swapped in later.
 
-Built with Tauri + Svelte (~2.6MB installer). Runs Lada via Docker and displays real-time progress.
+Built with Tauri + Svelte (~3 MB installer). Queue many files, run them in parallel, tune settings
+to your hardware automatically, and let it shut the PC down when done.
 
 ## Screenshots
 
@@ -14,173 +18,149 @@ Built with Tauri + Svelte (~2.6MB installer). Runs Lada via Docker and displays 
 
 ## Features
 
-- Drag & drop or browse to add video files
-- Real-time progress bar with ETA and speed
-- GPU encoding (NVENC) - minimal CPU load
-- Parallel processing (1~4 simultaneous files)
-- Auto-retry on failure (infinite, with logging)
-- Delete original after success
-- Auto shutdown PC after completion
-- Custom output path / filename prefix
-- One-click Lada Docker image update
+- **Two engines, one queue** — Lada (Docker) or JASNA (native). Switch in settings; nothing else changes.
+- **Auto settings** — detects GPU/VRAM, CPU cores, RAM, Docker's memory ceiling and free temp space,
+  then sets parallel jobs, clip length, container memory, FP16 and encoder — and shows *why*.
+- **Parallel processing** (up to 8 files at once). A single JASNA process does not saturate a big GPU,
+  and JASNA's own GUI is sequential-only, so this is where the throughput comes from.
+- **VR (side-by-side) videos** handled on both engines — see [VR videos](#vr-videos) below.
+- **In-app updates** — a banner appears when a new release is out; one click installs it (signed).
+- Real-time per-file progress with ETA and speed; drag & drop; delete original; shutdown after done.
+- Retries are bounded and classified: a lost drive or missing file fails immediately, transient
+  errors retry with backoff, and a job that gives up is marked failed rather than left "processing".
+- Temp folders left by a crash or a dropped drive are swept automatically on the next job.
 
-## Prerequisites
+## Quick start
 
-### 1. NVIDIA GPU Driver
+1. Install an NVIDIA driver (610+ recommended).
+2. Pick an engine and set it up — **A** or **B** below. You can install both and switch any time.
+3. Download `Lada GUI_x.x.x_x64-setup.exe` from [Releases](https://github.com/rhupy/ladaGUI/releases)
+   and install.
+4. In Settings, set **Settings Mode → Auto** (a fresh install starts in Auto already).
+5. Drag videos in and press **Start Processing**.
 
-An NVIDIA GPU is required. Install the latest driver.
+### A. JASNA engine (recommended for speed and for VR)
 
-- [NVIDIA Driver Download](https://www.nvidia.com/Download/index.aspx)
-- Driver version 570.0+ recommended (NVENC support)
+The app **never downloads or bundles JASNA** — it only detects and runs an install you made yourself
+(JASNA is AGPL, like Lada).
 
-### 2. Docker Desktop
+1. From the [JASNA releases](https://github.com/Kruk2/jasna/releases), download **every part** of the
+   Windows (NVIDIA) package (`.7z.001`, `.002`, `.003`) and extract them together.
+2. Install under an **ASCII-only path**, e.g. `C:\jasna` — that location is auto-detected. Anywhere
+   else: enter the `jasna.exe` path in Settings → **JASNA Path**.
+3. Requires an RTX 20-series or newer GPU and Windows driver 610+. The first run builds TensorRT
+   engines once (a few minutes on an RTX 5090).
+4. In Settings, set **Engine → JASNA**. The header should read `JASNA 0.10.0 ready`.
 
-Lada runs inside a Docker container.
+Docker is not needed on this engine. Pause is unavailable (a native CUDA process cannot be suspended
+safely); Cancel works.
 
-1. Download and install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-2. Use **WSL 2 backend** during installation (default)
-3. Launch Docker Desktop after installation
+### B. Lada engine (Docker)
 
-### 3. Docker Desktop GPU Setup
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) with the WSL 2 backend.
+2. Enable GPU access: Settings → Resources → WSL Integration (enable your distro), and make sure the
+   `nvidia` runtime is present under Settings → Docker Engine — otherwise install the
+   [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+3. Pull the image (~14 GB): `docker pull ladaapp/lada:latest`, or press **Update Lada** in the app.
+4. Verify: `docker run --rm --gpus all ladaapp/lada:latest nvidia-smi` should print your GPU.
+5. The header should read `Docker OK, GPU: NVIDIA`.
 
-GPU access in Docker requires additional configuration.
+## VR videos
 
-1. Open Docker Desktop
-2. Settings > Resources > WSL Integration - enable your WSL distro
-3. Settings > Docker Engine - verify the following exists:
-   ```json
-   {
-     "runtimes": {
-       "nvidia": {
-         "path": "nvidia-container-runtime",
-         "runtimeArgs": []
-       }
-     }
-   }
-   ```
-   If missing, install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Side-by-side (SBS) VR is detected automatically — a 2:1 frame taller than 1080p whose left and right
+halves are a stereo pair.
 
+- **JASNA** processes the two eyes inside its own pipeline: one pass, one encode, no split/merge.
+  For VR, choose the VR-trained detector: **Detection Model → `rfdetr-vr-v1`** (JASNA's own
+  recommendation; the generic `rfdetr-v6` misses mosaics on fisheye frames).
+- **Lada** cannot handle VR itself, so the app splits the file into left/right eyes, restores each
+  at 4K, and rejoins them. That is three encode generations and, because a 4K eye needs a short clip
+  window (20 frames) to fit in memory, noticeably less temporal stability. It works, but it is slow:
+  a 60 s 8K clip took 699 s on Lada versus 107 s on JASNA on the same machine.
 
-### 4. JASNA engine (optional, faster)
+## Measured performance
 
-Since v0.8.0 the app can drive [JASNA](https://github.com/Kruk2/jasna) instead of Lada. It uses the same
-restoration model but is several times faster (measured 2.6x per file on an RTX 5090, plus ~2x more
-throughput when running files in parallel) and handles VR per-eye internally with no split/merge.
+Same files, same machine (RTX 5090, Ryzen 9 9950X3D):
 
-The app **never downloads or bundles JASNA** — it only detects and runs an install you made yourself:
+| | Lada | JASNA |
+|---|---|---|
+| 90 s 1080p clip | 92 s | **35 s** (2.6×) |
+| 3 files at once (JASNA) | — | **2.06×** the throughput of one at a time |
+| 60 s 8K SBS VR | 699 s | **107 s** |
 
-1. Download **every part** of the Windows (NVIDIA) package from the JASNA releases page and extract it.
-2. Install under an **ASCII-only path** such as `C:\jasna` (auto-detected). Other locations can be set in
-   Settings → JASNA Path.
-3. The first run builds TensorRT engines (a few minutes, once).
-4. Requires an RTX 20-series or newer GPU and Windows driver 610+.
-
-Docker is not needed while the JASNA engine is selected. Pause is unavailable on JASNA (cancel works).
-
-### 4. Pull Lada Docker Image
-
-Pre-download the Lada image (~14GB):
-
-```bash
-docker pull ladaapp/lada:latest
-```
-
-Or use the **Update Lada** button in the app.
-
-### 5. Verify GPU Access (Optional)
-
-```bash
-docker run --rm --gpus all ladaapp/lada:latest nvidia-smi
-```
-
-If GPU info is displayed, you're good to go.
-
-## Installation
-
-1. Download `Lada GUI_x.x.x_x64-setup.exe` from [Releases](https://github.com/rhupy/lada/releases)
-2. Install and launch
-3. Verify `Docker OK, GPU: NVIDIA` in the top-right corner
-4. Drag video files or click Add Files
-5. Click Start Processing
+Clip length does not change Lada's speed (measured flat from 45 to 300 frames while VRAM doubled), so
+Auto keeps it at 180 for temporal stability rather than pushing it higher.
 
 ## Settings
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| Detection Model | v4-accurate | `v4-fast`: faster, `v4-accurate`: better quality |
-| Max Clip Length | 300 | Split long videos into N-second segments (reduce if VRAM is low) |
-| Parallel Jobs | 1 | Simultaneous files (increase with VRAM headroom, 2~4) |
-| Encoder | hevc_nvenc | GPU encoding. Use `libx265` if no GPU |
-| CRF / CQ | 18 | Quality (lower = better quality, larger file) |
-| Preset | medium | Encoding speed vs quality tradeoff |
-| Filename Prefix | [nm] | Prefix added to output filename |
-| Delete original | On | Delete source file after successful processing |
-| Shutdown after | Off | Shutdown PC after all files complete |
-| Output to same directory | On | Save output in same folder as source |
+Auto mode manages the starred rows and locks them; switch to Manual to set them yourself.
 
-## Recommended Settings by GPU
+| Setting | Default | Notes |
+|---|---|---|
+| Engine | Lada | `Lada` (Docker) or `JASNA` (native) |
+| JASNA Path | *(auto)* | Only needed if `jasna.exe` is not in a well-known location |
+| Settings Mode | Manual (Auto on fresh installs) | Auto derives the starred rows from detected hardware |
+| Detection Model | v4-accurate / rfdetr-v6 | Lists differ per engine. Use `rfdetr-vr-v1` for VR on JASNA |
+| Restoration Model | basicvsrpp-v1.2 | Lada only |
+| FP16 ★ | auto | Half precision; on for Volta and newer |
+| Max Clip Length ★ | 180 | **Frames**, not seconds. Higher = more temporal stability and more VRAM; past ~180 it stops paying off |
+| Parallel Jobs ★ | from hardware | Bounded by VRAM, CPU cores and Docker's memory ceiling |
+| Memory Limit ★ | from hardware | Per container, Lada only |
+| Encoder ★ | hevc_nvenc | `h264_nvenc` / `libx265` / `libx264` |
+| CRF / CQ | 18 | Lower = better quality, larger file |
+| Preset | medium | Encoder speed/quality trade-off |
+| Filename Prefix | [nm] | Prepended to output names |
+| Output to same directory | On | Or choose an output folder |
+| Delete original | On | After a successful run |
+| Shutdown after | Off | Power off when the queue finishes |
 
-### RTX 5090 / 4090 (VRAM 24~32GB)
-- Parallel Jobs: 2~4
-- Encoder: hevc_nvenc
-- Max Clip Length: 300~600
+## Updates
 
-### RTX 4070 / 3070 (VRAM 8~12GB)
-- Parallel Jobs: 1~2
-- Encoder: hevc_nvenc
-- Max Clip Length: 120~300
-
-### No GPU / Low-end
-- Parallel Jobs: 1
-- Encoder: libx265
-- Max Clip Length: 60~120
+From v0.7.0 the app checks GitHub on startup. When a newer release exists a banner offers a one-click
+update; it downloads, verifies the signature, installs and restarts. Updating is blocked while jobs
+are running, because the Windows installer has to close the app.
 
 ## Logs
 
-Failure/retry logs are saved to `lada-gui.log` in the app installation directory.
+`lada-gui.log` next to the executable records every spawned command, retries, failures, hardware
+detection and temp-folder sweeps.
 
 ## Troubleshooting
 
-### "Docker OK, GPU: not detected"
-- Ensure Docker Desktop is running
-- Verify NVIDIA driver is installed
-- Restart Docker Desktop and try again
+**`JASNA not found`** — make sure every archive part was extracted, the path has only ASCII characters,
+and `jasna.exe --version` runs from a terminal. Then set the path in Settings if it is not `C:\jasna`.
 
-### Immediate failure on start (exit code 125)
-- Check if GPU support is enabled in Docker Desktop
-- Test with: `docker run --rm --gpus all ladaapp/lada:latest nvidia-smi`
+**Mosaic still visible on a VR file (JASNA)** — set Detection Model to `rfdetr-vr-v1`. The generic
+detector is not trained for fisheye frames.
 
-### hevc_nvenc encoder error
-- Switch Encoder to `libx265` as a fallback
-- NVIDIA driver 570.0+ is required for NVENC
+**`Docker OK, GPU: not detected`** — Docker Desktop is running without GPU access; re-check step B.2
+and restart Docker Desktop.
 
-### Processing hangs
-- The app waits indefinitely as long as the process is alive
-- Try Cancel and restart
-- Failed processes are automatically retried
+**`exit code 125` / "drive unavailable"** — the drive holding the video went away mid-job (common with
+external disks). Reconnect it, then restart Docker Desktop: it keeps the broken mount until restarted.
+The job fails immediately instead of retrying forever, so just re-queue it.
 
-## Tech Stack
+**`exit code 137`** — out of memory in the container. Raise Memory Limit or lower Max Clip Length; the
+job retries on its own since a sibling job finishing often frees the memory.
 
-- **Frontend**: Svelte 5
-- **Backend**: Rust (Tauri v2)
-- **AI Engine**: [Lada](https://github.com/ladaapp/lada) (Docker)
-- **Build**: ~2.6MB Windows installer
+**Pause is greyed out** — you are on the JASNA engine; use Cancel.
+
+## Tech stack
+
+- Frontend: Svelte 5 · Backend: Rust (Tauri v2)
+- Engines: [Lada](https://github.com/ladaapp/lada) via Docker, [JASNA](https://github.com/Kruk2/jasna) native
+- Updater: tauri-plugin-updater, signed releases
 
 ## Development
 
 ```bash
 cd src
-
-# Install dependencies
 npm install
-
-# Run in development mode
-npm run tauri dev
-
-# Build for production
-npm run tauri build
+npm run tauri dev      # run
+npm run tauri build    # package
+cd src-tauri && cargo test   # backend tests
 ```
 
 ## License
 
-MIT
+MIT. Lada and JASNA are separate AGPL-3.0 projects; this app invokes them and bundles neither.
